@@ -48,7 +48,7 @@ with st.expander("What you're seeing (quick tour)", expanded=True):
 7. **Top alerts: Review the highest-score orders (time, customer, SKU, amount, geo, payment) for manual or escalation.
 8. **Model evaluation: If a label column (e.g., fraud_flag) exists, select it to compute Accuracy, Precision, Recall, F1, plus Confusion Matrix, ROC (AUC), and PR (AP)
 9. **Operating point helper: Use the precision/recall vs threshold chart to pick a threshold that meets your target (e.g., Precision ≥ 90% or Recall ≥ 70%).
-10.**Decide & act: Adjust the threshold, refine signals/rules, and track changes over time using the same flow(use left side)
+10. **Decide & act: Adjust the threshold, refine signals/rules, and track changes over time using the same flow(use left side)
 """
     )
 
@@ -489,6 +489,7 @@ if not use_bq:
         "No precomputed BigQuery metrics found for the selected window "
         f"(`{metrics_table}`). Showing local fallback."
     )
+
 
 
 
