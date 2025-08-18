@@ -19,7 +19,7 @@ from sklearn.metrics import (
 )
 
 # ------------------------- PAGE SETUP -------------------------
-st.set_page_config(page_title="Fraud detection dashboard", layout="wide")
+st.set_page_config(page_title="Fraud detection dashboard", page_icon="🛡️", layout="wide")
 st.markdown(
     """
 <style>
