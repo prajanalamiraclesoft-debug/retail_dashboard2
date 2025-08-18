@@ -77,8 +77,15 @@ with st.sidebar:
     threshold = st.slider("Alert threshold (score ≥ threshold ⇒ alert)", 0.00, 1.00, 0.30, 0.01)
 
 # ------------------------- BIGQUERY ---------------------------
-client = bigquery.Client(project=project)
+from google.oauth2 import service_account  # add if not already imported
 
+# Load GCP credentials from Streamlit Secrets
+credentials = service_account.Credentials.from_service_account_info(
+    st.secrets["gcp_service_account"]
+)
+
+# Create BigQuery client with those creds
+client = bigquery.Client(credentials=credentials, project=credentials.project_id)
 @st.cache_data(show_spinner=True)
 def load_data(_client: bigquery.Client, _pred_table: str, _feat_table: str, _start: date, _end: date) -> pd.DataFrame:
     """
@@ -478,3 +485,4 @@ if not use_bq:
         "No precomputed BigQuery metrics found for the selected window "
         f"(`{metrics_table}`). Showing local fallback."
     )
+
