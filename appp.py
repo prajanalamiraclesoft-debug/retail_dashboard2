@@ -39,7 +39,7 @@ with st.expander("What you're seeing (quick tour)", expanded=True):
 **Goal**: Provide a retail dashboard that tracks fraud risks, pricing anomalies, and inventory stress signals, helping monitor model outputs, key trends, and evaluation metrics in one place
 
 **How to read this page**
-1.Set filters: In the left sidebar, pick the date range and choose an alert threshold (score ≥ threshold ⇒ alert).
+1. **Set filters: In the left sidebar, pick the date range and choose an alert threshold (score ≥ threshold ⇒ alert).
 2. **Read KPIs: Check Scored, Alerts, Alert rate, and the Window/Threshold line to understand overall volume and alerting intensity.
 3. **Daily trend: Look for spikes/dips in the scored vs. alerts lines to spot unusual days or shifts after rule/model changes.
 4. **Score distribution: Use the histogram + vertical threshold line to see where scores cluster; adjust the threshold to balance alert volume vs. risk.
@@ -489,6 +489,7 @@ if not use_bq:
         "No precomputed BigQuery metrics found for the selected window "
         f"(`{metrics_table}`). Showing local fallback."
     )
+
 
 
 
