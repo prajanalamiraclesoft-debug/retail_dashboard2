@@ -31,7 +31,7 @@ hr {margin: 0.8rem 0;}
     unsafe_allow_html=True,
 )
 
-st.title("🛡️ Fraud detection dashboard")
+st.title("Retail Dashboard with Fraud detection and Inventory Optimization")
 
 with st.expander("What you're seeing (quick tour)", expanded=True):
     st.markdown(
@@ -40,15 +40,15 @@ with st.expander("What you're seeing (quick tour)", expanded=True):
 
 **How to read this page**
 1.Set filters: In the left sidebar, pick the date range and choose an alert threshold (score ≥ threshold ⇒ alert).
-2.Read KPIs: Check Scored, Alerts, Alert rate, and the Window/Threshold line to understand overall volume and alerting intensity.
-3.Daily trend: Look for spikes/dips in the scored vs. alerts lines to spot unusual days or shifts after rule/model changes.
-4.Score distribution: Use the histogram + vertical threshold line to see where scores cluster; adjust the threshold to balance alert volume vs. risk.
-5.Signals (context): In Strong-signal and Pricing/Inventory charts, compare bar lengths for “% in alerts” vs “% in non-alerts” to find signals that are over-represented in alerts.
-6.Correlation helper: Use the correlation bars to see which pricing/inventory signals move with (positive) or against (negative) the fraud score for quick feature/rule tuning.
-7.Top alerts: Review the highest-score orders (time, customer, SKU, amount, geo, payment) for manual triage or escalation.
-8.Model evaluation: If a label column (e.g., fraud_flag) exists, select it to compute Accuracy, Precision, Recall, F1, plus Confusion Matrix, ROC (AUC), and PR (AP); remember PR is most informative on imbalanced data.
-9.Operating point helper: Use the precision/recall vs threshold chart (BigQuery metrics if available, otherwise local) to pick a threshold that meets your target (e.g., Precision ≥ 90% or Recall ≥ 70%).
-10. Decide & act: Adjust the threshold, refine signals/rules, and track changes over time using the same flow(use left side)
+2. **Read KPIs: Check Scored, Alerts, Alert rate, and the Window/Threshold line to understand overall volume and alerting intensity.
+3. **Daily trend: Look for spikes/dips in the scored vs. alerts lines to spot unusual days or shifts after rule/model changes.
+4. **Score distribution: Use the histogram + vertical threshold line to see where scores cluster; adjust the threshold to balance alert volume vs. risk.
+5. **Signals (context): In Strong-signal and Pricing/Inventory charts, compare bar lengths for “% in alerts” vs “% in non-alerts” to find signals that are over-represented in alerts.
+6. **Correlation helper: Use the correlation bars to see which pricing/inventory signals move with (positive) or against (negative) the fraud score for quick feature/rule tuning.
+7. **Top alerts: Review the highest-score orders (time, customer, SKU, amount, geo, payment) for manual triage or escalation.
+8. **Model evaluation: If a label column (e.g., fraud_flag) exists, select it to compute Accuracy, Precision, Recall, F1, plus Confusion Matrix, ROC (AUC), and PR (AP); remember PR is most informative on imbalanced data.
+9. **Operating point helper: Use the precision/recall vs threshold chart (BigQuery metrics if available, otherwise local) to pick a threshold that meets your target (e.g., Precision ≥ 90% or Recall ≥ 70%).
+10.**Decide & act: Adjust the threshold, refine signals/rules, and track changes over time using the same flow(use left side)
 """
     )
 
