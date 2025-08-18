@@ -4,3 +4,5 @@ google-cloud-bigquery>=3.17.2
 db-dtypes>=1.2.0
 pyarrow>=14.0.2
 altair>=5.2.0
+scikit-learn
+
