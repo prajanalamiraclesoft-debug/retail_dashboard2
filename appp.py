@@ -4,8 +4,8 @@ from datetime import date
 from google.cloud import bigquery
 from sklearn.metrics import confusion_matrix,roc_curve,roc_auc_score,precision_recall_curve,auc,accuracy_score,precision_score,recall_score,f1_score
 
-st.set_page_config("Retail Dashboard", "🛡️", layout="wide")
-st.title("🛡️ Retail Dashboard — Fraud, Pricing & Inventory")
+st.set_page_config("Retail Dashboard", layout="wide")
+st.title("🛡 Retail Dashboard — Fraud, Pricing & Inventory")
 
 # --------- Inputs
 sb=st.sidebar; sb.header("Settings")
@@ -156,3 +156,4 @@ if op.empty:
 st.altair_chart(alt.Chart(op.melt("threshold",["precision","recall"],"metric","value"))
     .mark_line(point=True).encode(x="threshold:Q",y=alt.Y("value:Q",axis=alt.Axis(format="%")),color="metric:N",
               tooltip=["threshold:Q",alt.Tooltip("value:Q",format=".2%")]).properties(height=260),use_container_width=True)
+
