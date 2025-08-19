@@ -78,7 +78,7 @@ with st.sidebar:
         f"{project}.{dataset}.predictions_daily_metrics",
     )
 
-    start = st.date_input("Start (YYYY/MM/DD)", date(2024, 12, 1))
+    start = st.date_input("Start (YYYY/MM/DD)", date(2023, 1, 1))
     end = st.date_input("End (YYYY/MM/DD)", date(2024, 12, 31))
 
     threshold = st.slider("Alert threshold (score ≥ threshold ⇒ alert)", 0.00, 1.00, 0.30, 0.01)
@@ -494,6 +494,7 @@ if not use_bq:
         "No precomputed BigQuery metrics found for the selected window "
         f"(`{metrics_table}`). Showing local fallback."
     )
+
 
 
 
