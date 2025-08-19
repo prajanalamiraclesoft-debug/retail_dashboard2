@@ -1,179 +1,508 @@
-# app.py — fast mode
-import numpy as np, pandas as pd, altair as alt, streamlit as st
-from datetime import date
+
+# app.py — Fraud detection dashboard (BigQuery + Streamlit)
+# ----------------------------------------------------------
+import altair as alt
+import numpy as np
+import pandas as pd
+import streamlit as st
 from google.cloud import bigquery
-from sklearn.metrics import confusion_matrix, roc_curve, roc_auc_score, precision_recall_curve, auc, \
-                            accuracy_score, precision_score, recall_score, f1_score
+from datetime import date
+import altair as alt
+# Inline all data so Streamlit Cloud doesn't lose the dataset reference
+alt.data_transformers.enable("default", max_rows=None)
+alt.renderers.set_embed_options(actions=False)  # optional: hides "Open in Vega" menu
 
-st.set_page_config("Retail Dashboard", "🛡️", layout="wide")
-st.title("🛡️ Retail Dashboard — Fraud, Pricing & Inventory")
+from sklearn.metrics import (
+    confusion_matrix,
+    roc_curve,
+    roc_auc_score,
+    precision_recall_curve,
+    auc,
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+)
 
-# ---------- Inputs
-sb = st.sidebar; sb.header("Settings")
-P = sb.text_input("Project","mss-data-engineer-sandbox")
-D = sb.text_input("Dataset","retail")
-PT = sb.text_input("Predictions table", f"{P}.{D}.predictions_latest")
-FT = sb.text_input("Features table",    f"{P}.{D}.features_signals_v4")
-MT = sb.text_input("Metrics table (optional)", f"{P}.{D}.predictions_daily_metrics")
-S  = sb.date_input("Start", date(2024,12,1)); E = sb.date_input("End", date(2024,12,31))
-TH = sb.slider("Alert threshold (score ≥ threshold ⇒ alert)", 0.0, 1.0, 0.30, 0.01)
+# ------------------------- PAGE SETUP -------------------------
+st.set_page_config(page_title="Retail Dashboard with Fraud detection and Inventory Optimization", layout="wide")
+st.markdown(
+    """
+<style>
+.kpi {font-size: 1.8rem; font-weight: 700; margin-top: -10px}
+.kpi-meta {color: #6c757d; font-size: .9rem; margin-top: -8px}
+hr {margin: 0.8rem 0;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-# ---------- BigQuery client & cached loaders
-@st.cache_resource
-def get_bq_client(project): return bigquery.Client(project=project)
+st.title("Retail Dashboard with Fraud detection and Inventory Optimization")
+
+with st.expander("What you're seeing (quick tour)", expanded=True):
+    st.markdown(
+        """
+**Goal**: Provide a retail dashboard that tracks fraud risks, pricing anomalies, and inventory stress signals, helping monitor model outputs, key trends, and evaluation metrics in one place
+
+**How to read this page**
+1. **Set filters: In the left sidebar, pick the date range and choose an alert threshold (score ≥ threshold ⇒ alert).
+2. **Read KPIs: Check Scored, Alerts, Alert rate, and the Window/Threshold line to understand overall volume and alerting intensity.
+3. **Daily trend: Look for spikes/dips in the scored vs. alerts lines to spot unusual days or shifts after rule/model changes.
+4. **Score distribution: Use the histogram + vertical threshold line to see where scores cluster. adjust the threshold to balance alert volume vs. risk.
+5. **Signals (context): In Strong-signal and Pricing/Inventory charts, compare bar lengths for % in alerts vs % in non-alerts to find signals that are over-represented in alerts.
+6. **Correlation helper: Use the correlation bars to see which pricing/inventory signals move with (positive) or against (negative) the fraud score for quick feature/rule tuning.
+7. **Top alerts: Review the highest-score orders (time, customer, SKU, amount, geo, payment) for manual or escalation.
+8. **Model evaluation: If a label column (e.g., fraud_flag) exists, select it to compute Accuracy, Precision, Recall, F1, plus Confusion Matrix, ROC (AUC), and PR (AP)
+9. **Operating point helper: Use the precision/recall vs threshold chart to pick a threshold that meets your target (e.g., Precision ≥ 90% or Recall ≥ 70%).
+10. **Decide & act: Adjust the threshold, refine signals/rules, and track changes over time using the same flow(use left side)
+"""
+    )
+
+# ------------------------- SIDEBAR ----------------------------
+with st.sidebar:
+    st.header("Settings")
+    project = st.text_input("Project", "mss-data-engineer-sandbox")
+    dataset = st.text_input("Dataset", "retail")
+
+    pred_table = st.text_input(
+        "Predictions table (project.dataset.table)",
+        f"{project}.{dataset}.predictions_latest",
+    )
+    feat_table = st.text_input(
+        "Features table (project.dataset.table)",
+        f"{project}.{dataset}.features_signals_v4",
+    )
+
+    # Optional: precomputed daily metrics table (if you created it)
+    metrics_table = st.text_input(
+        "Precomputed metrics table (optional)",
+        f"{project}.{dataset}.predictions_daily_metrics",
+    )
+
+    start = st.date_input("Start (YYYY/MM/DD)", date(2023, 1, 1))
+    end = st.date_input("End (YYYY/MM/DD)", date(2024, 12, 31))
+
+    threshold = st.slider("Alert threshold (score ≥ threshold ⇒ alert)", 0.00, 1.00, 0.30, 0.01)
+
+# ------------------------- BIGQUERY ---------------------------
+import streamlit as st
+from google.cloud import bigquery
+from google.oauth2 import service_account
+
+# Read secrets and convert escaped "\n" to real newlines
+sa_info = dict(st.secrets["gcp_service_account"])
+sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
+
+credentials = service_account.Credentials.from_service_account_info(sa_info)
+client = bigquery.Client(credentials=credentials, project=credentials.project_id)
 
 @st.cache_data(show_spinner=True)
-def load_main(client, pt, ft, s, e):
+def load_data(_client: bigquery.Client, _pred_table: str, _feat_table: str, _start: date, _end: date) -> pd.DataFrame:
+    """
+    Pull a single joined dataset once for the chosen date window.
+    """
     sql = f"""
     SELECT
-      p.order_id, p.timestamp, p.customer_id, p.store_id, p.sku_id, p.sku_category,
-      p.order_amount, p.quantity, p.payment_method, p.shipping_country, p.ip_country,
+      p.order_id,
+      p.timestamp,
+      p.customer_id,
+      p.store_id,
+      p.sku_id,
+      p.sku_category,
+      p.order_amount,
+      p.quantity,
+      p.payment_method,
+      p.shipping_country,
+      p.ip_country,
       CAST(p.fraud_score AS FLOAT64) AS fraud_score,
-      SAFE_CAST(s.fraud_flag AS INT64) AS fraud_flag,
-      s.high_price_anomaly, s.low_price_anomaly, s.oversell_flag, s.stockout_risk_flag, s.hoarding_flag,
-      s.strong_tri_mismatch_high_value, s.strong_high_value_express_geo, s.strong_burst_multi_device,
-      s.strong_price_drop_bulk, s.strong_giftcard_geo, s.strong_return_whiplash,
-      s.strong_price_inventory_stress, s.strong_country_flip_express
-    FROM `{pt}` p
-    LEFT JOIN `{ft}` s USING(order_id)
-    WHERE DATE(p.timestamp) BETWEEN @s AND @e
+
+      -- STRONG COMBOS
+      s.strong_tri_mismatch_high_value,
+      s.strong_high_value_express_geo,
+      s.strong_burst_multi_device,
+      s.strong_price_drop_bulk,
+      s.strong_giftcard_geo,
+      s.strong_return_whiplash,
+      s.strong_price_inventory_stress,
+      s.strong_country_flip_express,
+
+      -- PRICING / INVENTORY
+      s.high_price_anomaly,
+      s.low_price_anomaly,
+      s.oversell_flag,
+      s.stockout_risk_flag,
+      s.hoarding_flag,
+
+      -- GROUND TRUTH (if present)
+      SAFE_CAST(s.fraud_flag AS INT64) AS fraud_flag
+    FROM `{_pred_table}` p
+    LEFT JOIN `{_feat_table}` s
+      USING(order_id)
+    WHERE DATE(p.timestamp) BETWEEN @start AND @end
+    ORDER BY timestamp
     """
-    job = client.query(sql, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("s","DATE",str(s)),
-                          bigquery.ScalarQueryParameter("e","DATE",str(e))],
-        ))
-    df = job.result().to_dataframe(bqstorage_client=client._transport._bqstorage_client)  # fast path
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df["fraud_score"] = pd.to_numeric(df["fraud_score"], errors="coerce")
-    df["date"] = df["timestamp"].dt.date
+    job = _client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("start", "DATE", str(_start)),
+                bigquery.ScalarQueryParameter("end", "DATE", str(_end)),
+            ]
+        ),
+    )
+    df = job.result().to_dataframe(create_bqstorage_client=False)
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=False, errors="coerce")
     return df
 
-@st.cache_data(show_spinner=False)
-def load_trend(client, pt, s, e):
-    sql = f"""
-      SELECT DATE(timestamp) AS date, COUNT(1) n
-      FROM `{pt}` WHERE DATE(timestamp) BETWEEN @s AND @e
-      GROUP BY date ORDER BY date
-    """
-    job = client.query(sql, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("s","DATE",str(s)),
-                          bigquery.ScalarQueryParameter("e","DATE",str(e))]))
-    return job.result().to_dataframe()
+df = load_data(client, pred_table, feat_table, start, end)
 
-client = get_bq_client(P)
-df = load_main(client, PT, FT, S, E)
-if df.empty: st.info("No rows in this window."); st.stop()
+if df.empty:
+    st.warning("No rows in this date window. Try expanding the date range.")
+    st.stop()
 
-# ---------- Flags & KPIs
-df["is_alert"] = (df["fraud_score"] >= TH).astype(int)
-n, a = len(df), int(df["is_alert"].sum()); r = a/n if n else 0
-c1,c2,c3,c4 = st.columns([1,1,1,2])
-c1.metric("Scored", n); c2.metric("Alerts", a); c3.metric("Alert rate", f"{r:.2%}")
-c4.caption(f"Window: {df['timestamp'].min()} → {df['timestamp'].max()}  |  Threshold: {TH:.2f}")
+# normalize basics used later
+df["fraud_score"] = pd.to_numeric(df["fraud_score"], errors="coerce")
+df["is_alert"] = (df["fraud_score"] >= threshold).astype(int)
+df["date"] = df["timestamp"].dt.date
 
-# ---------- Daily trend (server aggregated)
-trend = load_trend(client, PT, S, E)
-alerts_by_day = df.groupby("date")["is_alert"].sum().rename("alerts").reset_index()
-trend = trend.merge(alerts_by_day, how="left", on="date").fillna(0)
+# ------------------------- KPIs --------------------------------
+total_scored = int(len(df))
+total_alerts = int(df["is_alert"].sum())
+alert_rate = (total_alerts / total_scored) if total_scored else 0.0
+
+c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+c1.markdown(f"<div class='kpi'>{total_scored}</div>", unsafe_allow_html=True)
+c1.markdown("<div class='kpi-meta'>Scored</div>", unsafe_allow_html=True)
+
+c2.markdown(f"<div class='kpi'>{total_alerts}</div>", unsafe_allow_html=True)
+c2.markdown("<div class='kpi-meta'>Alerts</div>", unsafe_allow_html=True)
+
+c3.markdown(f"<div class='kpi'>{alert_rate:.2%}</div>", unsafe_allow_html=True)
+c3.markdown("<div class='kpi-meta'>Alert rate</div>", unsafe_allow_html=True)
+
+c4.markdown(
+    f"<div class='kpi-meta'>Window: <b>{df['timestamp'].min()}</b> → "
+    f"<b>{df['timestamp'].max()}</b> &nbsp;|&nbsp; Threshold: <b>{threshold:.2f}</b></div>",
+    unsafe_allow_html=True,
+)
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# ------------------------- DAILY TREND -------------------------
 st.subheader("Daily trend")
-st.altair_chart(alt.Chart(trend.melt("date", ["n","alerts"], "series", "count"))
-  .mark_line(point=True).encode(x="date:T", y="count:Q", color="series:N",
-  tooltip=["date:T","series:N","count:Q"]).properties(height=240), use_container_width=True)
+trend = (
+    df.groupby("date")
+    .agg(n=("order_id", "count"), alerts=("is_alert", "sum"))
+    .reset_index()
+)
 
-# ---------- Score distribution
+if trend.empty:
+    st.info("No activity on the selected dates.")
+else:
+    trend_long = trend.melt(id_vars="date", value_vars=["n", "alerts"], var_name="series", value_name="count")
+    line = (
+        alt.Chart(trend_long)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y("count:Q", title="Count"),
+            color=alt.Color("series:N", title=None),
+            tooltip=["date:T", "series:N", "count:Q"],
+        )
+        .properties(height=280)
+    )
+    st.altair_chart(line, use_container_width=True)
+
+# ------------------------- SCORE DISTRIBUTION ------------------
 st.subheader("Fraud-score distribution")
-hist = (alt.Chart(df).mark_bar().encode(
-  x=alt.X("fraud_score:Q", bin=alt.Bin(maxbins=50)), y="count():Q")).properties(height=220)
-rule = alt.Chart(pd.DataFrame({"x":[TH]})).mark_rule(color="crimson").encode(x="x:Q")
-st.altair_chart(hist + rule, use_container_width=True)
+hist = (
+    alt.Chart(df)
+    .mark_bar()
+    .encode(
+        x=alt.X("fraud_score:Q", bin=alt.Bin(maxbins=50), title="Fraud score"),
+        y=alt.Y("count():Q", title="Count"),
+        tooltip=[alt.Tooltip("count()", title="Count")],
+    )
+    .properties(height=220)
+)
+th_rule = alt.Chart(pd.DataFrame({"x": [threshold]})).mark_rule(color="crimson").encode(x="x")
+st.altair_chart(hist + th_rule, use_container_width=True)
 
-# ---------- Signal prevalence
-def prevalence(cols, title):
-    present = [c for c in cols if c in df.columns]
-    if not present: st.info(f"No signals for {title}."); return
-    da=max(int((df["is_alert"]==1).sum()),1); dn=max(int((df["is_alert"]==0).sum()),1)
-    rows=[{"signal":c,
-           "% in alerts": int(pd.to_numeric(df[c],errors="coerce").fillna(0).astype(int)[df["is_alert"]==1].sum())/da,
-           "% in non-alerts": int(pd.to_numeric(df[c],errors="coerce").fillna(0).astype(int)[df["is_alert"]==0].sum())/dn}
-          for c in present]
-    dd=pd.DataFrame(rows).sort_values("% in alerts",ascending=False)
-    st.altair_chart(alt.Chart(dd.melt("signal", ["% in alerts","% in non-alerts"], "group","value"))
-      .mark_bar().encode(x=alt.X("value:Q", axis=alt.Axis(format="%")),
-      y=alt.Y("signal:N", sort="-x"), color="group:N").properties(height=320, title=title),
-      use_container_width=True)
+# ------------------------- CONTEXT SIGNALS --------------------
+def prevalence_bar(_df: pd.DataFrame, cols: list, title: str):
+    present = [c for c in cols if c in _df.columns]
+    if not present:
+        st.info(f"No matching signals found for: {title}")
+        return
+    rows = []
+    for c in present:
+        col = pd.to_numeric(_df[c], errors="coerce").fillna(0).astype(int)
+        in_alerts = int(col[_df["is_alert"] == 1].sum())
+        in_non_alerts = int(col[_df["is_alert"] == 0].sum())
+        denom_alerts = max(int((_df["is_alert"] == 1).sum()), 1)
+        denom_non_alerts = max(int((_df["is_alert"] == 0).sum()), 1)
+        rows.append({"signal": c, "% in alerts": in_alerts / denom_alerts, "% in non-alerts": in_non_alerts / denom_non_alerts})
+    dd = pd.DataFrame(rows).sort_values("% in alerts", ascending=False)
+    dd_long = dd.melt(id_vars="signal", var_name="group", value_name="value")
+    chart = (
+        alt.Chart(dd_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("value:Q", axis=alt.Axis(format="%"), title="Prevalence"),
+            y=alt.Y("signal:N", sort="-x", title=None),
+            color=alt.Color("group:N", title=None),
+            tooltip=["signal:N", alt.Tooltip("value:Q", title="prevalence", format=".1%"), "group:N"],
+        )
+        .properties(height=320, title=title)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 st.subheader("Context signals")
-lc, rc = st.columns(2)
-with lc: prevalence(["strong_tri_mismatch_high_value","strong_high_value_express_geo","strong_burst_multi_device",
-  "strong_price_drop_bulk","strong_giftcard_geo","strong_return_whiplash","strong_price_inventory_stress",
-  "strong_country_flip_express"], "Strong-signal prevalence")
-with rc: prevalence(["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_flag","hoarding_flag"],
-  "Pricing & Inventory signal prevalence")
+left, right = st.columns(2)
 
-# ---------- Correlation (numeric-only safe)
-st.caption("Correlation of fraud_score with pricing/inventory signals (Pearson)")
-cols=[c for c in ["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_flag","hoarding_flag"] if c in df]
-if cols:
-    cdf=df[["fraud_score"]+cols].apply(pd.to_numeric, errors="coerce")
-    cor=cdf.corr().loc[cols,"fraud_score"].rename("corr").reset_index().rename(columns={"index":"signal"})
-    st.altair_chart(alt.Chart(cor).mark_bar().encode(x="corr:Q", y=alt.Y("signal:N", sort="x")).properties(height=160),
-                    use_container_width=True)
+with left:
+    prevalence_bar(
+        df,
+        [
+            "strong_tri_mismatch_high_value",
+            "strong_high_value_express_geo",
+            "strong_burst_multi_device",
+            "strong_price_drop_bulk",
+            "strong_giftcard_geo",
+            "strong_return_whiplash",
+            "strong_price_inventory_stress",
+            "strong_country_flip_express",
+        ],
+        "Strong-signal prevalence (alerts vs non-alerts)",
+    )
 
-# ---------- Top alerts (limit display for speed)
+with right:
+    prevalence_bar(
+        df,
+        ["high_price_anomaly", "low_price_anomaly", "oversell_flag", "stockout_risk_flag", "hoarding_flag"],
+        "Pricing & Inventory signal prevalence",
+    )
+
+# ------------------------- CORRELATION ------------------------
+st.caption("Correlation of `fraud_score` with pricing/inventory signals (Pearson, numeric-only safe)")
+corr_cols = [c for c in ["high_price_anomaly", "low_price_anomaly", "oversell_flag", "stockout_risk_flag", "hoarding_flag"] if c in df.columns]
+if corr_cols:
+    corr_df = df.copy()
+    corr_df["fraud_score"] = pd.to_numeric(corr_df["fraud_score"], errors="coerce")
+    for c in corr_cols:
+        corr_df[c] = pd.to_numeric(corr_df[c], errors="coerce")
+    corr_series = corr_df[["fraud_score"] + corr_cols].corr(method="pearson")["fraud_score"].drop("fraud_score")
+    corr_plot_df = corr_series.rename("corr").reset_index().rename(columns={"index": "signal"})
+    corr_plot = (
+        alt.Chart(corr_plot_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("corr:Q", title="Correlation (score vs signal)"),
+            y=alt.Y("signal:N", sort="x", title=None),
+            tooltip=[alt.Tooltip("corr:Q", format=".3f"), "signal:N"],
+            color=alt.condition(alt.datum.corr > 0, alt.value("#1f77b4"), alt.value("#d62728")),
+        )
+        .properties(height=140)
+    )
+    st.altair_chart(corr_plot, use_container_width=True)
+else:
+    st.info("No pricing/inventory columns available to compute correlation.")
+
+# ------------------------- TOP ALERTS -------------------------
 st.subheader("Top alerts (highest scores)")
-keep=[c for c in ["order_id","timestamp","customer_id","store_id","sku_id","sku_category",
-                  "order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"] if c in df]
-st.dataframe(df.sort_values(["fraud_score","timestamp"],ascending=[False,False]).loc[:,keep].head(100),
-             use_container_width=True, height=360)
+top = (
+    df.sort_values(["fraud_score", "timestamp"], ascending=[False, False])
+    .head(50)
+    .loc[
+        :,
+        [
+            c
+            for c in [
+                "order_id",
+                "timestamp",
+                "customer_id",
+                "store_id",
+                "sku_id",
+                "sku_category",
+                "order_amount",
+                "quantity",
+                "payment_method",
+                "shipping_country",
+                "ip_country",
+                "fraud_score",
+            ]
+            if c in df.columns
+        ],
+    ]
+)
+st.dataframe(top, use_container_width=True, height=360)
 
-# ---------- Model evaluation (lazy compute)
-with st.expander("Model evaluation (Accuracy/Precision/Recall/F1, CM, ROC, PR)", expanded=False):
-    lbls=[c for c in ["fraud_flag","is_fraud","label","ground_truth","gt","y"] if c in df]
-    y   = df[lbls[0]].fillna(0).astype(int).values if lbls else (df["fraud_score"]>=TH).astype(int).values
-    yhat= (df["fraud_score"]>=TH).astype(int).values; ysc=df["fraud_score"].values
-    m1,m2,m3,m4=st.columns(4)
-    m1.metric("Accuracy",f"{accuracy_score(y,yhat):.2%}")
-    m2.metric("Precision",f"{precision_score(y,yhat,zero_division=0):.2%}")
-    m3.metric("Recall",f"{recall_score(y,yhat,zero_division=0):.2%}")
-    m4.metric("F1-score",f"{f1_score(y,yhat,zero_division=0):.2%}")
-    cm=confusion_matrix(y,yhat,labels=[0,1])
-    cmd=pd.DataFrame(cm,index=["Actual: 0","Actual: 1"],columns=["Pred: 0","Pred: 1"]).reset_index()
-    cml=cmd.melt("Actual","Predicted","Count")
-    st.altair_chart(alt.Chart(cml).mark_rect().encode(x="Predicted:N",y="Actual:N",color=alt.Color("Count:Q",scale=alt.Scale(scheme="blues")))
-                     + alt.Chart(cml).mark_text(baseline="middle").encode(x="Predicted:N",y="Actual:N",text="Count:Q"),
-                     use_container_width=True)
-    try: auc_roc=roc_auc_score(y,ysc)
-    except: auc_roc=float("nan")
-    fpr,tpr,_=roc_curve(y,ysc); pr,rc,_=precision_recall_curve(y,ysc); ap=auc(rc,pr)
-    st.altair_chart(alt.Chart(pd.DataFrame({"fpr":fpr,"tpr":tpr})).mark_line().encode(x="fpr:Q",y="tpr:Q")
-                    .properties(height=240,title=f"ROC (AUC={auc_roc:.3f})"), use_container_width=True)
-    st.altair_chart(alt.Chart(pd.DataFrame({"recall":rc,"precision":pr})).mark_line()
-                    .encode(x="recall:Q",y="precision:Q").properties(height=240,title=f"PR (AP≈{ap:.3f})"),
-                    use_container_width=True)
+# ------------------------- MODEL EVALUATION -------------------
+st.subheader("Model evaluation")
 
-# ---------- Operating point helper (BQ metrics if present, else local)
+label_candidates = ["fraud_flag", "is_fraud", "label", "ground_truth", "gt", "y"]
+present = [c for c in label_candidates if c in df.columns]
+
+if present:
+    label_col = st.selectbox("Ground-truth label column (1 = fraud, 0 = legit)", options=present, index=0)
+    y_true = df[label_col].fillna(0).astype(int).values
+    st.caption(f"Using ground-truth column: `{label_col}`.")
+else:
+    st.warning(
+        "No ground-truth label column found (e.g., `fraud_flag`). "
+        "Using the model’s current decision as a temporary label for evaluation."
+    )
+    label_col = None
+    y_true = (df["fraud_score"] >= threshold).astype(int).values
+
+y_pred = (df["fraud_score"] >= threshold).astype(int).values
+y_score = df["fraud_score"].values
+
+acc = accuracy_score(y_true, y_pred)
+prec = precision_score(y_true, y_pred, zero_division=0)
+rec = recall_score(y_true, y_pred, zero_division=0)
+f1 = f1_score(y_true, y_pred, zero_division=0)
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Accuracy", f"{acc:.2%}")
+m2.metric("Precision", f"{prec:.2%}")
+m3.metric("Recall", f"{rec:.2%}")
+m4.metric("F1-score", f"{f1:.2%}")
+
+# Confusion matrix
+cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+cm_df = pd.DataFrame(cm, index=pd.Index(["Actual: 0", "Actual: 1"], name="Actual"), columns=["Pred: 0", "Pred: 1"]).reset_index()
+cm_long = cm_df.melt(id_vars=["Actual"], var_name="Predicted", value_name="Count")
+
+cm_chart = (
+    alt.Chart(cm_long)
+    .mark_rect()
+    .encode(
+        x=alt.X("Predicted:N"),
+        y=alt.Y("Actual:N"),
+        color=alt.Color("Count:Q", scale=alt.Scale(scheme="blues")),
+        tooltip=["Actual:N", "Predicted:N", "Count:Q"],
+    )
+    .properties(height=200)
+)
+cm_text = alt.Chart(cm_long).mark_text(baseline="middle", fontSize=14).encode(x="Predicted:N", y="Actual:N", text="Count:Q")
+st.altair_chart(cm_chart + cm_text, use_container_width=True)
+
+# ROC curve + AUC
+try:
+    auc_roc = roc_auc_score(y_true, y_score)
+except ValueError:
+    auc_roc = float("nan")
+
+fpr, tpr, _ = roc_curve(y_true, y_score)
+roc_df = pd.DataFrame({"fpr": fpr, "tpr": tpr})
+roc_chart = (
+    alt.Chart(roc_df)
+    .mark_line()
+    .encode(
+        x=alt.X("fpr:Q", title="False Positive Rate"),
+        y=alt.Y("tpr:Q", title="True Positive Rate"),
+        tooltip=[alt.Tooltip("fpr:Q", format=".3f"), alt.Tooltip("tpr:Q", format=".3f")],
+    )
+    .properties(height=260, title=f"ROC curve (AUC = {auc_roc:.3f})")
+)
+diag = alt.Chart(pd.DataFrame({"x": [0, 1], "y": [0, 1]})).mark_rule(strokeDash=[4, 4]).encode(x="x", y="y")
+st.altair_chart(roc_chart + diag, use_container_width=True)
+
+# Precision–Recall curve + AP
+prec_curve, rec_curve, _ = precision_recall_curve(y_true, y_score)
+ap = auc(rec_curve, prec_curve)
+pr_df = pd.DataFrame({"recall": rec_curve, "precision": prec_curve})
+pr_chart = (
+    alt.Chart(pr_df)
+    .mark_line()
+    .encode(
+        x=alt.X("recall:Q", title="Recall"),
+        y=alt.Y("precision:Q", title="Precision"),
+        tooltip=[alt.Tooltip("recall:Q", format=".3f"), alt.Tooltip("precision:Q", format=".3f")],
+    )
+    .properties(height=260, title=f"Precision–Recall curve (AP ≈ {ap:.3f})")
+)
+st.altair_chart(pr_chart, use_container_width=True)
+
+# --------------------- OPERATING POINT HELPER -----------------
 st.subheader("Operating point helper (precision/recall vs threshold)")
-@st.cache_data(show_spinner=False)
-def load_op(client, mt, s, e):
-    try:
-        q=f"SELECT threshold,AVG(precision) precision,AVG(recall) recall FROM `{mt}` WHERE dt BETWEEN @s AND @e GROUP BY threshold"
-        job=client.query(q, job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("s","DATE",str(s)),
-                              bigquery.ScalarQueryParameter("e","DATE",str(e))]))
-        return job.result().to_dataframe()
-    except: return pd.DataFrame()
 
-op = load_op(client, MT, S, E)
-if op.empty:
-    grid=np.round(np.linspace(0.05,0.95,19),2); rows=[]
-    # vectorized counts against df['is_alert'] (already computed)
+def load_bq_op_metrics(_client: bigquery.Client, _metrics_table: str, _start: date, _end: date) -> pd.DataFrame:
+    sql = f"""
+    SELECT threshold,
+           AVG(precision) AS precision,
+           AVG(recall)    AS recall
+    FROM `{_metrics_table}`
+    WHERE dt BETWEEN @start AND @end
+    GROUP BY threshold
+    ORDER BY threshold
+    """
+    job = _client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("start", "DATE", str(_start)),
+                bigquery.ScalarQueryParameter("end", "DATE", str(_end)),
+            ]
+        ),
+    )
+    return job.result().to_dataframe(create_bqstorage_client=False)
+
+use_bq = False
+op_df = pd.DataFrame()
+try:
+    # try BigQuery metrics (table must exist)
+    op_df = load_bq_op_metrics(client, metrics_table, start, end)
+    use_bq = not op_df.empty
+except Exception:
+    use_bq = False
+
+if use_bq:
+    chart_df = op_df.melt("threshold", ["precision", "recall"], "metric", "value")
+else:
+    # local fallback: sweep thresholds on the current df
+    grid = np.round(np.linspace(0.05, 0.95, 19), 2)
+    rows = []
     for th in grid:
-        pred=(df["fraud_score"]>=th).astype(int)
-        tp=int(((pred==1)&(df["is_alert"]==1)).sum()); fp=int(((pred==1)&(df["is_alert"]==0)).sum())
-        fn=int(((pred==0)&(df["is_alert"]==1)).sum())
-        rows.append({"threshold":th,"precision": tp/(tp+fp) if (tp+fp)>0 else 0.0,
-                              "recall":    tp/(tp+fn) if (tp+fn)>0 else 0.0})
-    op=pd.DataFrame(rows); st.caption("No precomputed BigQuery metrics; showing local fallback.")
-st.altair_chart(alt.Chart(op.melt("threshold", ["precision","recall"], "metric","value"))
-  .mark_line(point=True).encode(x="threshold:Q", y=alt.Y("value:Q", axis=alt.Axis(format="%")), color="metric:N",
-  tooltip=["threshold:Q", alt.Tooltip("value:Q", format=".2%")]).properties(height=260), use_container_width=True)
+        pred = (df["fraud_score"] >= th).astype(int)
+        tp = int(((pred == 1) & (df["is_alert"] == 1)).sum())
+        fp = int(((pred == 1) & (df["is_alert"] == 0)).sum())
+        fn = int(((pred == 0) & (df["is_alert"] == 1)).sum())
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        rows.append({"threshold": th, "precision": precision, "recall": recall})
+    op_df = pd.DataFrame(rows)
+    chart_df = op_df.melt("threshold", ["precision", "recall"], "metric", "value")
+
+op_chart = (
+    alt.Chart(chart_df)
+    .mark_line(point=True)
+    .encode(
+        x=alt.X("threshold:Q"),
+        y=alt.Y("value:Q", axis=alt.Axis(format="%")),
+        color=alt.Color("metric:N", title=None),
+        tooltip=["threshold:Q", alt.Tooltip("value:Q", format=".2%")],
+    )
+    .properties(height=260, title=("BigQuery metrics" if use_bq else "Local fallback"))
+)
+st.altair_chart(op_chart, use_container_width=True)
+
+if not use_bq:
+    st.caption(
+        "No precomputed BigQuery metrics found for the selected window "
+        f"(`{metrics_table}`). Showing local fallback."
+    )
+
+
+
+
+
+
+
+
+
+
+
