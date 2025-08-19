@@ -4,13 +4,12 @@ from google.cloud import bigquery; from google.oauth2 import service_account
 from sklearn.metrics import confusion_matrix, roc_curve, roc_auc_score, precision_recall_curve, auc, accuracy_score, precision_score, recall_score, f1_score
 st.set_page_config("Retail Dashboard: Fraud & Inventory", layout="wide"); alt.data_transformers.enable("default", max_rows=None); alt.renderers.set_embed_options(actions=False)
 
-# -------- Sidebar --------
 with st.sidebar:
     st.header("BQ Table Info"); P=st.text_input("Project","mss-data-engineer-sandbox"); D=st.text_input("Dataset","retail")
     PT=st.text_input("Predictions",f"{P}.{D}.predictions_latest"); FT=st.text_input("Features",f"{P}.{D}.features_signals_v4")
     MT=st.text_input("Metrics (optional)",f"{P}.{D}.predictions_daily_metrics"); S=st.date_input("Start",date(2023,1,1)); E=st.date_input("End",date(2024,12,31)); TH=st.slider("Alert threshold (≥)",0.00,1.00,0.30,0.01)
 
-# -------- BigQuery --------
+#BigQuery
 sa=dict(st.secrets["gcp_service_account"]); sa["private_key"]=sa["private_key"].replace("\\n","\n")
 creds=service_account.Credentials.from_service_account_info(sa); bq=bigquery.Client(credentials=creds, project=creds.project_id)
 
@@ -27,11 +26,11 @@ df=load_df(PT,FT,S,E)
 if df.empty: st.warning("No rows in this window."); st.stop()
 df["fraud_score"]=pd.to_numeric(df["fraud_score"],errors="coerce").fillna(0.0); df["is_alert"]=(df["fraud_score"]>=TH).astype(int); df["day"]=df["timestamp"].dt.floor("D")
 
-# -------- KPIs --------
+# KPIs
 c1,c2,c3,c4=st.columns([1,1,1,2]); TOT=len(df); AL=int(df["is_alert"].sum()); c1.metric("Scored",TOT); c2.metric("Alerts",AL); c3.metric("Alert rate",f"{(AL/TOT if TOT else 0):.2%}")
 c4.caption(f"Window: {df['timestamp'].min()} → {df['timestamp'].max()} | Threshold: {TH:.2f}"); st.markdown("---")
 
-# -------- Trend --------
+# Trend
 st.subheader("Daily trend")
 tr=df.groupby("day").agg(scored=("order_id","count"),alerts=("is_alert","sum")).reset_index()
 if len(tr):
@@ -57,17 +56,17 @@ st.subheader("Context signals"); l,r=st.columns(2)
 with l: prev(["strong_tri_mismatch_high_value","strong_high_value_express_geo","strong_burst_multi_device","strong_price_drop_bulk","strong_giftcard_geo","strong_return_whiplash","strong_price_inventory_stress","strong_country_flip_express"],"Strong-signal prevalence")
 with r: prev(["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_flag","hoarding_flag"],"Pricing & Inventory prevalence")
 
-# -------- Correlations --------
+# Correlations
 st.caption("Correlation of fraud_score with pricing/inventory signals (Pearson)")
 C=[c for c in ["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_flag","hoarding_flag"] if c in df]
 if C: co=df[["fraud_score"]+C].apply(pd.to_numeric,errors="coerce").fillna(0).corr().loc[C,"fraud_score"].reset_index().rename(columns={"index":"signal","fraud_score":"corr"}); st.altair_chart(alt.Chart(co).mark_bar().encode(x="corr:Q",y=alt.Y("signal:N",sort="x",title=None),tooltip=[alt.Tooltip("corr:Q",format=".3f")]).properties(height=120),use_container_width=True)
 else: st.info("No pricing/inventory columns to correlate.")
 
-# -------- Top alerts --------
+# Top alerts
 st.subheader("Top alerts"); cols=[c for c in ["order_id","timestamp","customer_id","store_id","sku_id","sku_category","order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"] if c in df]
 st.dataframe(df.sort_values(["fraud_score","timestamp"],ascending=[False,False]).loc[:,cols].head(50),use_container_width=True,height=320)
 
-# -------- Evaluation --------
+#Evaluation
 st.subheader("Model evaluation"); L=[c for c in ["fraud_flag","is_fraud","label","ground_truth","gt","y"] if c in df]
 if L: lab=st.selectbox("Ground-truth (1=fraud,0=legit)",L,0); y_true=df[lab].fillna(0).astype(int).values; st.caption(f"Using: `{lab}`")
 else: st.warning("No label column; using decision as proxy."); y_true=(df["fraud_score"]>=TH).astype(int).values
@@ -80,7 +79,7 @@ except: A=float("nan")
 fpr,tpr,_=roc_curve(y_true,y_score); st.altair_chart(alt.Chart(pd.DataFrame({"fpr":fpr,"tpr":tpr})).mark_line().encode(x=alt.X("fpr:Q",title="FPR"),y=alt.Y("tpr:Q",title="TPR")).properties(height=200,title=f"ROC (AUC={A:.3f})"),use_container_width=True)
 P,R,_=precision_recall_curve(y_true,y_score); AP=auc(R,P); st.altair_chart(alt.Chart(pd.DataFrame({"recall":R,"precision":P})).mark_line().encode(x="recall:Q",y="precision:Q").properties(height=200,title=f"Precision–Recall (AP≈{AP:.3f})"),use_container_width=True)
 
-# -------- Operating point helper --------
+# Operating point helper
 @st.cache_data(show_spinner=False)
 def load_ops(MT,S,E):
     sql=f"SELECT threshold,AVG(precision) precision,AVG(recall) recall FROM `{MT}` WHERE dt BETWEEN @S AND @E GROUP BY threshold ORDER BY threshold"
@@ -92,4 +91,5 @@ except: use_bq=False
 if not use_bq: grid=np.round(np.linspace(0.05,0.95,19),2); OP=pd.DataFrame([{"threshold":t,"precision":(((df["fraud_score"]>=t)&(y_true==1)).sum()/max(1,(df["fraud_score"]>=t).sum())),"recall":(((df["fraud_score"]>=t)&(y_true==1)).sum()/max(1,(y_true==1).sum()))} for t in grid])
 st.altair_chart(alt.Chart(OP.melt(id_vars="threshold",value_vars=["precision","recall"],var_name="metric",value_name="value")).mark_line(point=True).encode(x="threshold:Q",y=alt.Y("value:Q",axis=alt.Axis(format="%")),color="metric:N").properties(height=200,title=("BigQuery metrics" if use_bq else "Local fallback")),use_container_width=True)
 if not use_bq: st.caption(f"No precomputed metrics at `{MT}`; showing local sweep.")
+
 
