@@ -1,4 +1,3 @@
-
 # app.py — Fraud detection dashboard (BigQuery + Streamlit)
 # ----------------------------------------------------------
 import altair as alt
