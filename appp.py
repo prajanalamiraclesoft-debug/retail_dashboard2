@@ -7,9 +7,8 @@ import streamlit as st
 from google.cloud import bigquery
 from datetime import date
 import altair as alt
-# Inline all data so Streamlit Cloud doesn't lose the dataset reference
 alt.data_transformers.enable("default", max_rows=None)
-alt.renderers.set_embed_options(actions=False)  # optional: hides "Open in Vega" menu
+alt.renderers.set_embed_options(actions=False)  
 
 from sklearn.metrics import (
     confusion_matrix,
@@ -494,6 +493,7 @@ if not use_bq:
         "No precomputed BigQuery metrics found for the selected window "
         f"(`{metrics_table}`). Showing local fallback."
     )
+
 
 
 
