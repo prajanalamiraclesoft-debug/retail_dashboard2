@@ -6,9 +6,9 @@ st.set_page_config("Retail Dashboard: Fraud & Inventory", layout="wide"); alt.da
 
 # -------- Sidebar --------
 with st.sidebar:
-    st.header("Settings"); P=st.text_input("Project","mss-data-engineer-sandbox"); D=st.text_input("Dataset","retail")
+    st.header("BQ Table Info"); P=st.text_input("Project","mss-data-engineer-sandbox"); D=st.text_input("Dataset","retail")
     PT=st.text_input("Predictions",f"{P}.{D}.predictions_latest"); FT=st.text_input("Features",f"{P}.{D}.features_signals_v4")
-    MT=st.text_input("Metrics (optional)",f"{P}.{D}.predictions_daily_metrics"); S=st.date_input("Start",date(2024,12,1)); E=st.date_input("End",date(2024,12,31)); TH=st.slider("Alert threshold (≥)",0.00,1.00,0.30,0.01)
+    MT=st.text_input("Metrics (optional)",f"{P}.{D}.predictions_daily_metrics"); S=st.date_input("Start",date(2023,1,1)); E=st.date_input("End",date(2024,12,31)); TH=st.slider("Alert threshold (≥)",0.00,1.00,0.30,0.01)
 
 # -------- BigQuery --------
 sa=dict(st.secrets["gcp_service_account"]); sa["private_key"]=sa["private_key"].replace("\\n","\n")
@@ -92,3 +92,4 @@ except: use_bq=False
 if not use_bq: grid=np.round(np.linspace(0.05,0.95,19),2); OP=pd.DataFrame([{"threshold":t,"precision":(((df["fraud_score"]>=t)&(y_true==1)).sum()/max(1,(df["fraud_score"]>=t).sum())),"recall":(((df["fraud_score"]>=t)&(y_true==1)).sum()/max(1,(y_true==1).sum()))} for t in grid])
 st.altair_chart(alt.Chart(OP.melt(id_vars="threshold",value_vars=["precision","recall"],var_name="metric",value_name="value")).mark_line(point=True).encode(x="threshold:Q",y=alt.Y("value:Q",axis=alt.Axis(format="%")),color="metric:N").properties(height=200,title=("BigQuery metrics" if use_bq else "Local fallback")),use_container_width=True)
 if not use_bq: st.caption(f"No precomputed metrics at `{MT}`; showing local sweep.")
+
