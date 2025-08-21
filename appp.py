@@ -95,11 +95,29 @@ prev(["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_fl
 
 # ---- Top Alerts ----
 st.subheader("**Top Alerts (score ≥ 0.30)**")
-st.caption("the highest-risk orders to review first within your date range.")
-cols=[c for c in ["order_id","timestamp","customer_id","store_id","sku_id","sku_category",
-                  "order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"] if c in df]
-st.dataframe(df[df.is_alert==1].sort_values(["fraud_score","timestamp"],ascending=[False,False]).loc[:,cols].head(50),
-             use_container_width=True,height=320)
+st.caption("**Plain-English:** the highest-risk orders to review first within your date range.")
+
+# Build, sort, and (optionally) de-duplicate by order_id if your join can create duplicates
+alerts_df = (
+    df[df["is_alert"] == 1]
+      .sort_values(["fraud_score", "timestamp"], ascending=[False, False])
+      .drop_duplicates(subset=["order_id"])  # remove dup orders if any
+)
+
+# Let the user decide how many to show (default = all alerts)
+max_rows = int(len(alerts_df))
+show_n = st.number_input("How many alerts to show?", 1, max_rows, max_rows, step=10)
+
+cols = [c for c in [
+    "order_id","timestamp","customer_id","store_id","sku_id","sku_category",
+    "order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"
+] if c in alerts_df]
+
+st.dataframe(alerts_df.loc[:, cols].head(show_n), use_container_width=True, height=340)
+
+# Easy export (so row counts in Sheets = data rows only)
+csv = alerts_df.loc[:, cols].to_csv(index=False).encode("utf-8")
+st.download_button("Download all alerts (CSV)", csv, "alerts_selected_window.csv", "text/csv")
 
 # ---- Model Evaluation ----
 st.subheader("**Model Evaluation at 0.30**")
@@ -110,6 +128,7 @@ c1.metric("Accuracy",f"{accuracy_score(y_true,y_pred):.2%}")
 c2.metric("Precision",f"{precision_score(y_true,y_pred,zero_division=0):.2%}")
 c3.metric("Recall",f"{recall_score(y_true,y_pred,zero_division=0):.2%}")
 c4.metric("F1-score",f"{f1_score(y_true,y_pred,zero_division=0):.2%}")
+
 
 
 
