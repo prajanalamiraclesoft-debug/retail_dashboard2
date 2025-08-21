@@ -103,12 +103,13 @@ st.dataframe(df[df.is_alert==1].sort_values(["fraud_score","timestamp"],ascendin
 
 # ---- Model Evaluation ----
 st.subheader("**Model Evaluation at 0.30**")
-st.caption("** **Precision**=among alerts, how many were truly fraud; **Recall**=among true fraud, how many we caught; **F1**=balance of precision & recall; **Accuracy**=overall right/wrong rate.")
+st.caption("Precision**=among alerts, how many were truly fraud; **Recall**=among true fraud, how many we caught; **F1**=balance of precision & recall; **Accuracy**=overall right/wrong rate.")
 y_true=(df.get("fraud_flag",df["is_alert"])).fillna(0).astype(int); y_pred=df["is_alert"]
 c1,c2,c3,c4=st.columns(4)
 c1.metric("Accuracy",f"{accuracy_score(y_true,y_pred):.2%}")
 c2.metric("Precision",f"{precision_score(y_true,y_pred,zero_division=0):.2%}")
 c3.metric("Recall",f"{recall_score(y_true,y_pred,zero_division=0):.2%}")
 c4.metric("F1-score",f"{f1_score(y_true,y_pred,zero_division=0):.2%}")
+
 
 
