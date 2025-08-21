@@ -9,18 +9,22 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score
 )
 
-# ---------- Page setup ----------
+# ===================== PAGE & LIBS =====================
 st.set_page_config("Retail Dashboard: Fraud & Inventory", layout="wide")
 alt.data_transformers.enable("default", max_rows=None)
 alt.renderers.set_embed_options(actions=False)
 
-# ---------- BigQuery client (must be before sidebar) ----------
+# ===================== BIGQUERY CLIENT (BEFORE SIDEBAR) =====================
 sa = dict(st.secrets["gcp_service_account"])
 sa["private_key"] = sa["private_key"].replace("\\n", "\n")
 creds = service_account.Credentials.from_service_account_info(sa)
 bq = bigquery.Client(credentials=creds, project=creds.project_id)
 
-# ---------- Helpers ----------
+# ===================== CONSTANT: FIXED THRESHOLD =====================
+# Per manager feedback: ALL metrics and flags are based ONLY on threshold = 0.30
+THRESHOLD = 0.30
+
+# ===================== HELPERS =====================
 @st.cache_data(show_spinner=False)
 def get_min_max_ts(table_fqdn: str):
     sql = f"SELECT MIN(DATE(timestamp)) AS min_d, MAX(DATE(timestamp)) AS max_d FROM `{table_fqdn}`"
@@ -34,6 +38,7 @@ def get_min_max_ts(table_fqdn: str):
 
 @st.cache_data(show_spinner=True)
 def load_df(PT, FT, S, E):
+    # Only rows in selected date range are returned.
     sql = f"""
     SELECT
       p.order_id, p.timestamp, p.customer_id, p.store_id, p.sku_id, p.sku_category,
@@ -62,41 +67,21 @@ def load_df(PT, FT, S, E):
     d["timestamp"] = pd.to_datetime(d["timestamp"], errors="coerce").dt.tz_localize(None)
     return d
 
-@st.cache_data(show_spinner=False)
-def load_ops(MT, S, E):
-    sql = f"""
-    SELECT threshold, AVG(precision) AS precision, AVG(recall) AS recall
-    FROM `{MT}`
-    WHERE dt BETWEEN @S AND @E
-    GROUP BY threshold
-    ORDER BY threshold
-    """
-    return bq.query(
-        sql,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("S", "DATE", str(S)),
-                bigquery.ScalarQueryParameter("E", "DATE", str(E)),
-            ]
-        ),
-    ).result().to_dataframe()
-
-# ---------- Sidebar ----------
+# ===================== SIDEBAR (DATA RANGE IS DYNAMIC) =====================
 with st.sidebar:
-    st.header("BQ Table Info")
+    st.header("**BigQuery Tables**")
     P = st.text_input("Project", "mss-data-engineer-sandbox")
     D = st.text_input("Dataset", "retail")
     PT = st.text_input("Predictions", f"{P}.{D}.predictions_latest")
     FT = st.text_input("Features", f"{P}.{D}.features_signals_v4")
     MT = st.text_input("Metrics (optional)", f"{P}.{D}.predictions_daily_metrics")
 
-    # Determine data bounds
+    # Data bounds from table
     try:
         data_min, data_max = get_min_max_ts(PT)
     except Exception:
         data_min, data_max = date(2023, 1, 1), date.today()
 
-    # Central Time "today"
     CT = ZoneInfo("America/Chicago")
     today_ct = datetime.now(CT).date()
 
@@ -136,51 +121,60 @@ with st.sidebar:
         S = st.date_input("Start", value=max(data_min, today_ct - timedelta(days=29)), min_value=data_min, max_value=data_max)
         E = st.date_input("End", value=data_max, min_value=data_min, max_value=data_max)
 
-    TH = st.slider("Alert threshold (≥)", 0.00, 1.00, 0.30, 0.01)
+# ===================== HEADER =====================
+st.markdown("## **Retail Risk Dashboard — Fraud & Inventory**")
+st.info("**All metrics, alerts, and decisions in this app use a FIXED threshold of 0.30 (score ≥ 0.30).**")
 
-# ---------- Data ----------
+# ===================== LOAD DATA (STRICTLY FILTERED BY SELECTED DATES) =====================
 df = load_df(PT, FT, S, E)
 if df.empty:
-    st.warning("No rows in this window.")
+    st.warning("**No rows in the selected date range. Adjust the dates and try again.**")
     st.stop()
 
+# Derived columns
 df["fraud_score"] = pd.to_numeric(df["fraud_score"], errors="coerce").fillna(0.0)
-df["is_alert"] = (df["fraud_score"] >= TH).astype(int)
+df["is_alert"] = (df["fraud_score"] >= THRESHOLD).astype(int)  # Fixed threshold
 df["day"] = df["timestamp"].dt.floor("D")
 
-# ---------- KPIs ----------
+# ===================== KPIs =====================
+st.markdown("### **Key Performance Indicators (based on selected date range & threshold = 0.30)**")
 c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
-TOT = len(df)
-AL = int(df["is_alert"].sum())
-c1.metric("Scored", TOT)
-c2.metric("Alerts", AL)
-c3.metric("Alert rate", f"{(AL / TOT if TOT else 0):.2%}")
-c4.caption(f"Window: {df['timestamp'].min()} → {df['timestamp'].max()} | Threshold: {TH:.2f}")
+TOTAL = len(df)
+ALERTS = int(df["is_alert"].sum())
+c1.metric("**Total transactions**", TOTAL)
+c2.metric("**Fraud alerts (score ≥ 0.30)**", ALERTS)
+c3.metric("**Alert rate (≥ 0.30)**", f"{(ALERTS / TOTAL if TOTAL else 0):.2%}")
+c4.caption(f"**Window:** {df['timestamp'].min()} → {df['timestamp'].max()}  |  **Threshold:** {THRESHOLD:.2f}")
 st.markdown("---")
 
-# ---------- Daily trend ----------
-st.subheader("Daily trend")
-tr = df.groupby("day").agg(scored=("order_id", "count"), alerts=("is_alert", "sum")).reset_index()
+# ===================== DAILY TREND =====================
+st.markdown("### **Daily Trend**")
+st.caption("**What it shows:** Daily **total transactions** and **fraud alerts** within the **selected date range** only.")
+
+tr = df.groupby("day").agg(total_txn=("order_id", "count"), fraud_alerts=("is_alert", "sum")).reset_index()
 if len(tr):
-    tl = tr.melt(id_vars="day", value_vars=["scored", "alerts"], var_name="series", value_name="value")
+    tl = tr.melt(id_vars="day", value_vars=["total_txn", "fraud_alerts"], var_name="series", value_name="value")
+    tl["series"] = tl["series"].replace({"total_txn": "Total transactions", "fraud_alerts": "Fraud alerts (≥ 0.30)"})
     st.altair_chart(
         alt.Chart(tl)
         .mark_line(point=True)
         .encode(
-            x="day:T",
-            y="value:Q",
-            color="series:N",
-            tooltip=[alt.Tooltip("day:T"), "series:N", alt.Tooltip("value:Q")],
+            x=alt.X("day:T", title="Day"),
+            y=alt.Y("value:Q", title="Count"),
+            color=alt.Color("series:N", title="Series"),
+            tooltip=[alt.Tooltip("day:T", title="Day"), "series:N", alt.Tooltip("value:Q", title="Count")],
         )
         .properties(height=260),
         use_container_width=True,
     )
 else:
-    st.info("No activity.")
+    st.info("**No activity in this range.**")
 
-# ---------- Score distribution ----------
-st.subheader("Fraud-score distribution")
-h = (
+# ===================== SCORE DISTRIBUTION =====================
+st.markdown("### **Fraud-Score Distribution**")
+st.caption("**What it shows:** Histogram of the model’s fraud scores in the selected window. **Red line** marks the **fixed threshold (0.30)** used for alerts and metrics.")
+
+hist = (
     alt.Chart(df)
     .mark_bar()
     .encode(
@@ -191,27 +185,25 @@ h = (
     .properties(height=200)
 )
 st.altair_chart(
-    h + alt.Chart(pd.DataFrame({"x": [TH]})).mark_rule(color="crimson").encode(x="x"),
+    hist + alt.Chart(pd.DataFrame({"x": [THRESHOLD]})).mark_rule(color="crimson").encode(x="x"),
     use_container_width=True,
 )
 
-# ---------- Signal prevalence ----------
-def prev(cols, title):
+# ===================== CONTEXT SIGNALS =====================
+st.markdown("### **Context Signals — Prevalence**")
+st.caption("**What it shows:** For each signal, the share of **alerts** (score ≥ 0.30) and **non-alerts** that contain that signal. Helps explain *why* items are flagged.")
+
+def prevalence_chart(cols, title):
     cols = [c for c in cols if c in df]
     if not cols:
-        st.info(f"No signals for: {title}")
+        st.info(f"**No signals found for: {title}**")
         return
-    z = df[["is_alert"] + cols].apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
-    a = int(z["is_alert"].sum()) or 1
-    na = int((1 - z["is_alert"]).sum()) or 1
-    rows = [
-        {
-            "signal": c,
-            "% in alerts": z.loc[z.is_alert == 1, c].sum() / a,
-            "% in non-alerts": z.loc[z.is_alert == 0, c].sum() / na,
-        }
-        for c in cols
-    ]
+    Z = df[["is_alert"] + cols].apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+    a = int(Z["is_alert"].sum()) or 1
+    na = int((1 - Z["is_alert"]).sum()) or 1
+    rows = [{"signal": c,
+             "% in alerts": Z.loc[Z.is_alert == 1, c].sum() / a,
+             "% in non-alerts": Z.loc[Z.is_alert == 0, c].sum() / na} for c in cols]
     dd = (
         pd.DataFrame(rows)
         .sort_values("% in alerts", ascending=False)
@@ -223,37 +215,59 @@ def prev(cols, title):
         .encode(
             x=alt.X("value:Q", axis=alt.Axis(format="%"), title="Prevalence"),
             y=alt.Y("signal:N", sort="-x", title=None),
-            color="group:N",
+            color=alt.Color("group:N", title=None),
             tooltip=["signal:N", alt.Tooltip("value:Q", format=".1%"), "group:N"],
         )
-        .properties(title=title, height=300),
+        .properties(title=title, height=320),
         use_container_width=True,
     )
 
-st.subheader("Context signals")
-l, r = st.columns(2)
-with l:
-    prev(
+left, right = st.columns(2)
+with left:
+    prevalence_chart(
         [
-            "strong_tri_mismatch_high_value",
-            "strong_high_value_express_geo",
-            "strong_burst_multi_device",
-            "strong_price_drop_bulk",
-            "strong_giftcard_geo",
-            "strong_return_whiplash",
-            "strong_price_inventory_stress",
-            "strong_country_flip_express",
+            "strong_tri_mismatch_high_value",      # High-value + billing/shipping/IP mismatch
+            "strong_high_value_express_geo",       # High-value + express shipping + geo mismatch
+            "strong_burst_multi_device",           # Many orders from multiple devices in short time
+            "strong_price_drop_bulk",              # Big price drop + bulk quantity
+            "strong_giftcard_geo",                 # Gift card usage with geo mismatch
+            "strong_return_whiplash",              # Rapid return/re-purchase behavior
+            "strong_price_inventory_stress",       # Price anomaly while inventory is stressed
+            "strong_country_flip_express",         # Country flip with express shipping
         ],
-        "Strong-signal prevalence",
+        "**Strong-Signal Prevalence (Fraud risk indicators)**",
     )
-with r:
-    prev(
-        ["high_price_anomaly", "low_price_anomaly", "oversell_flag", "stockout_risk_flag", "hoarding_flag"],
-        "Pricing & Inventory prevalence",
+with right:
+    prevalence_chart(
+        [
+            "high_price_anomaly",                  # Price unusually high vs baseline
+            "low_price_anomaly",                   # Price unusually low vs baseline
+            "oversell_flag",                       # Demand surge vs stock → oversell risk
+            "stockout_risk_flag",                  # Low inventory risk of stockout
+            "hoarding_flag",                       # Abnormally large/bulk purchase
+        ],
+        "**Pricing & Inventory Prevalence (Operational risk)**",
     )
 
-# ---------- Correlations ----------
-st.caption("Correlation of fraud_score with pricing/inventory signals (Pearson)")
+with st.expander("**What each signal means (quick reference)**", expanded=False):
+    st.markdown("""
+- **strong_tri_mismatch_high_value** — High order value plus **billing vs shipping vs IP** mismatch.  
+- **strong_high_value_express_geo** — High value + **express** shipping + **geo** mismatch.  
+- **strong_burst_multi_device** — Short-window activity bursts across **multiple devices**.  
+- **strong_price_drop_bulk** — **Large price drop** combined with **bulk** quantity.  
+- **strong_giftcard_geo** — **Gift card** usage with **geo** mismatch.  
+- **strong_return_whiplash** — Fast **return/repurchase** cycles (abuse).  
+- **strong_price_inventory_stress** — **Price anomaly** while **inventory is tight**.  
+- **strong_country_flip_express** — Country flips plus **express** shipping.  
+- **high_price_anomaly / low_price_anomaly** — Price far from normal (too high / too low).  
+- **oversell_flag** — Risk of selling more units than available.  
+- **stockout_risk_flag** — Inventory near depletion.  
+- **hoarding_flag** — Abnormally large orders / quantities.
+""")
+
+# ===================== CORRELATIONS =====================
+st.markdown("### **Correlation with Fraud Score**")
+st.caption("**What it shows:** Pearson correlation between **fraud_score** and pricing/inventory signals (higher = more positively associated with risk).")
 C = [c for c in ["high_price_anomaly", "low_price_anomaly", "oversell_flag", "stockout_risk_flag", "hoarding_flag"] if c in df]
 if C:
     co = (
@@ -268,62 +282,60 @@ if C:
     st.altair_chart(
         alt.Chart(co)
         .mark_bar()
-        .encode(x="corr:Q", y=alt.Y("signal:N", sort="x", title=None), tooltip=[alt.Tooltip("corr:Q", format=".3f")])
-        .properties(height=120),
+        .encode(
+            x=alt.X("corr:Q", title="Correlation"),
+            y=alt.Y("signal:N", sort="x", title=None),
+            tooltip=[alt.Tooltip("corr:Q", format=".3f")],
+        )
+        .properties(height=140),
         use_container_width=True,
     )
 else:
-    st.info("No pricing/inventory columns to correlate.")
+    st.info("**No pricing/inventory columns available to correlate.**")
 
-# ---------- Top alerts ----------
-st.subheader("Top alerts")
+# ===================== TOP ALERTS (SCORE ≥ 0.30) =====================
+st.markdown("### **Top Alerts (score ≥ 0.30)**")
+st.caption("**What it shows:** Highest-risk transactions in the selected window for investigation.")
 cols = [
-    c
-    for c in [
-        "order_id",
-        "timestamp",
-        "customer_id",
-        "store_id",
-        "sku_id",
-        "sku_category",
-        "order_amount",
-        "quantity",
-        "payment_method",
-        "shipping_country",
-        "ip_country",
-        "fraud_score",
-    ]
-    if c in df
+    c for c in [
+        "order_id","timestamp","customer_id","store_id","sku_id","sku_category",
+        "order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"
+    ] if c in df
 ]
 st.dataframe(
-    df.sort_values(["fraud_score", "timestamp"], ascending=[False, False]).loc[:, cols].head(50),
-    use_container_width=True,
-    height=320,
+    df[df["is_alert"] == 1]
+      .sort_values(["fraud_score","timestamp"], ascending=[False, False])
+      .loc[:, cols]
+      .head(50),
+    use_container_width=True, height=340
 )
 
-# ---------- Evaluation ----------
-st.subheader("Model evaluation")
-L = [c for c in ["fraud_flag", "is_fraud", "label", "ground_truth", "gt", "y"] if c in df]
-if L:
-    lab = st.selectbox("Ground-truth (1=fraud,0=legit)", L, 0)
-    st.caption(f"Using: `{lab}`")
+# ===================== MODEL EVALUATION (FIXED THRESHOLD 0.30) =====================
+st.markdown("### **Model Evaluation (Threshold = 0.30 only)**")
+st.caption("**What it shows:** Metrics computed at **exactly 0.30** threshold — **Accuracy, Precision, Recall, F1**, plus **ROC** and **PR** curves for overall ranking quality.")
+
+# Choose ground-truth label if present
+label_candidates = [c for c in ["fraud_flag","is_fraud","label","ground_truth","gt","y"] if c in df]
+if label_candidates:
+    lab = st.selectbox("**Ground-truth column (1=fraud, 0=legit)**", label_candidates, 0)
+    st.caption(f"**Using label:** `{lab}`")
     y_true = df[lab].fillna(0).astype(int).values
 else:
-    st.warning("No label column; using decision as proxy.")
-    y_true = (df["fraud_score"] >= TH).astype(int).values
+    st.warning("**No ground-truth label found; using decision at 0.30 as proxy (for demonstration).**")
+    y_true = (df["fraud_score"] >= THRESHOLD).astype(int).values
 
-y_pred = (df["fraud_score"] >= TH).astype(int).values
+y_pred = (df["fraud_score"] >= THRESHOLD).astype(int).values
 y_score = df["fraud_score"].values
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Accuracy", f"{accuracy_score(y_true, y_pred):.2%}")
-m2.metric("Precision", f"{precision_score(y_true, y_pred, zero_division=0):.2%}")
-m3.metric("Recall", f"{recall_score(y_true, y_pred, zero_division=0):.2%}")
-m4.metric("F1-score", f"{f1_score(y_true, y_pred, zero_division=0):.2%}")
+m1.metric("**Accuracy (at 0.30)**", f"{accuracy_score(y_true, y_pred):.2%}")
+m2.metric("**Precision (at 0.30)**", f"{precision_score(y_true, y_pred, zero_division=0):.2%}")
+m3.metric("**Recall (at 0.30)**", f"{recall_score(y_true, y_pred, zero_division=0):.2%}")
+m4.metric("**F1-score (at 0.30)**", f"{f1_score(y_true, y_pred, zero_division=0):.2%}")
 
 cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
 cm_long = (
-    pd.DataFrame(cm, index=["Actual: 0", "Actual: 1"], columns=["Pred: 0", "Pred: 1"])
+    pd.DataFrame(cm, index=["Actual: 0 (Legit)", "Actual: 1 (Fraud)"], columns=["Pred: 0", "Pred: 1"])
     .reset_index()
     .melt(id_vars="index", var_name="Predicted", value_name="Count")
     .rename(columns={"index": "Actual"})
@@ -331,65 +343,39 @@ cm_long = (
 st.altair_chart(
     alt.Chart(cm_long)
     .mark_rect()
-    .encode(x="Predicted:N", y="Actual:N", color=alt.Color("Count:Q", scale=alt.Scale(scheme="blues")))
-    .properties(height=180),
+    .encode(
+        x=alt.X("Predicted:N", title=None),
+        y=alt.Y("Actual:N", title=None),
+        color=alt.Color("Count:Q", scale=alt.Scale(scheme="blues")),
+        tooltip=["Actual:N","Predicted:N","Count:Q"]
+    )
+    .properties(height=200, title="**Confusion Matrix (at 0.30)**"),
     use_container_width=True,
 )
 
 try:
-    A = roc_auc_score(y_true, y_score)
+    AUC = roc_auc_score(y_true, y_score)
 except Exception:
-    A = float("nan")
+    AUC = float("nan")
 
 fpr, tpr, _ = roc_curve(y_true, y_score)
 st.altair_chart(
     alt.Chart(pd.DataFrame({"fpr": fpr, "tpr": tpr}))
     .mark_line()
-    .encode(x=alt.X("fpr:Q", title="FPR"), y=alt.Y("tpr:Q", title="TPR"))
-    .properties(height=200, title=f"ROC (AUC={A:.3f})"),
+    .encode(x=alt.X("fpr:Q", title="False Positive Rate"), y=alt.Y("tpr:Q", title="True Positive Rate"))
+    .properties(height=220, title=f"**ROC Curve (AUC = {AUC:.3f})**"),
     use_container_width=True,
 )
 
-P_, R_, _ = precision_recall_curve(y_true, y_score)
-AP = auc(R_, P_)
+prec, rec, _ = precision_recall_curve(y_true, y_score)
+AP = auc(rec, prec)
 st.altair_chart(
-    alt.Chart(pd.DataFrame({"recall": R_, "precision": P_}))
+    alt.Chart(pd.DataFrame({"recall": rec, "precision": prec}))
     .mark_line()
-    .encode(x="recall:Q", y="precision:Q")
-    .properties(height=200, title=f"Precision–Recall (AP≈{AP:.3f})"),
+    .encode(x=alt.X("recall:Q", title="Recall"), y=alt.Y("precision:Q", title="Precision"))
+    .properties(height=220, title=f"**Precision–Recall Curve (AP ≈ {AP:.3f})**"),
     use_container_width=True,
 )
 
-# ---------- Operating point helper ----------
-st.subheader("Operating point helper")
-use_bq = True
-try:
-    OP = load_ops(MT, S, E)
-    use_bq = not OP.empty
-except Exception:
-    use_bq = False
-
-if not use_bq:
-    grid = np.round(np.linspace(0.05, 0.95, 19), 2)
-    pos = max(1, (y_true == 1).sum())
-    OP = pd.DataFrame(
-        [
-            {
-                "threshold": t,
-                "precision": (((df["fraud_score"] >= t) & (y_true == 1)).sum() / max(1, (df["fraud_score"] >= t).sum())),
-                "recall": (((df["fraud_score"] >= t) & (y_true == 1)).sum() / pos),
-            }
-            for t in grid
-        ]
-    )
-
-st.altair_chart(
-    alt.Chart(OP.melt(id_vars="threshold", value_vars=["precision", "recall"], var_name="metric", value_name="value"))
-    .mark_line(point=True)
-    .encode(x="threshold:Q", y=alt.Y("value:Q", axis=alt.Axis(format="%")), color="metric:N")
-    .properties(height=200, title=("BigQuery metrics" if use_bq else "Local fallback")),
-    use_container_width=True,
-)
-
-if not use_bq:
-    st.caption(f"No precomputed metrics at `{MT}`; showing local sweep.")
+# ===================== FOOTNOTE =====================
+st.caption("**Note:** All sections above reflect **only** the transactions within the **selected date range** and apply a **fixed threshold of 0.30** to compute alerts and evaluation metrics.")
