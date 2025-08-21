@@ -54,7 +54,7 @@ st.markdown("---")
 
 # ---- Daily Trend ----
 st.subheader("**Daily Trend**")
-st.caption("**Plain-English:** day-by-day totals vs risky orders **only** inside the chosen dates to spot spikes or drops.")
+st.caption("** day-by-day totals vs risky orders **only** inside the chosen dates to spot spikes or drops.")
 tr=df.groupby("day").agg(total=("order_id","count"),alerts=("is_alert","sum")).reset_index()
 if not tr.empty:
     tl=tr.melt("day",["total","alerts"],"type","value")
@@ -65,7 +65,7 @@ if not tr.empty:
 
 # ---- Score Distribution ----
 st.subheader("**Fraud Score Distribution**")
-st.caption("**Plain-English:** how risky orders look from 0–1; the red line at 0.30 is where we call an **alert** (example: $300 express order with billing–shipping–IP mismatch).")
+st.caption("** how risky orders look from 0–1; the red line at 0.30 is where we call an **alert** (example: $300 express order with billing–shipping–IP mismatch).")
 st.altair_chart(
     alt.Chart(df).mark_bar().encode(
         x=alt.X("fraud_score:Q",bin=alt.Bin(maxbins=50),title="Fraud score"),y="count()",tooltip=["count()"]
@@ -75,7 +75,7 @@ st.altair_chart(
 
 # ---- Context Signals (why flagged) ----
 st.subheader("**Context Signals — what risky behavior we see**")
-st.caption("**Plain-English:** compares how often each red-flag pattern appears in **alerts vs non-alerts** to explain **why** items were flagged.")
+st.caption("** compares how often each red-flag pattern appears in **alerts vs non-alerts** to explain **why** items were flagged.")
 def prev(cols,title):
     cols=[c for c in cols if c in df]
     if not cols: return st.info(f"No signals for {title}")
@@ -95,7 +95,7 @@ prev(["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_fl
 
 # ---- Top Alerts ----
 st.subheader("**Top Alerts (score ≥ 0.30)**")
-st.caption("**Plain-English:** the highest-risk orders to review first within your date range.")
+st.caption("** the highest-risk orders to review first within your date range.")
 cols=[c for c in ["order_id","timestamp","customer_id","store_id","sku_id","sku_category",
                   "order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"] if c in df]
 st.dataframe(df[df.is_alert==1].sort_values(["fraud_score","timestamp"],ascending=[False,False]).loc[:,cols].head(50),
@@ -103,10 +103,11 @@ st.dataframe(df[df.is_alert==1].sort_values(["fraud_score","timestamp"],ascendin
 
 # ---- Model Evaluation ----
 st.subheader("**Model Evaluation at 0.30**")
-st.caption("**Plain-English:** **Precision**=among alerts, how many were truly fraud; **Recall**=among true fraud, how many we caught; **F1**=balance of precision & recall; **Accuracy**=overall right/wrong rate.")
+st.caption("** **Precision**=among alerts, how many were truly fraud; **Recall**=among true fraud, how many we caught; **F1**=balance of precision & recall; **Accuracy**=overall right/wrong rate.")
 y_true=(df.get("fraud_flag",df["is_alert"])).fillna(0).astype(int); y_pred=df["is_alert"]
 c1,c2,c3,c4=st.columns(4)
 c1.metric("Accuracy",f"{accuracy_score(y_true,y_pred):.2%}")
 c2.metric("Precision",f"{precision_score(y_true,y_pred,zero_division=0):.2%}")
 c3.metric("Recall",f"{recall_score(y_true,y_pred,zero_division=0):.2%}")
 c4.metric("F1-score",f"{f1_score(y_true,y_pred,zero_division=0):.2%}")
+
