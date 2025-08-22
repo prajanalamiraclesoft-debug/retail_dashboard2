@@ -26,7 +26,7 @@ with st.sidebar:
     st.text_input("Project", "mss-data-engineer-sandbox", disabled=True)
     st.text_input("Dataset", "retail", disabled=True)
     st.text_input("Raw table", "mss-data-engineer-sandbox.retail.transaction_data", disabled=True)
-    st.caption("Note: The SQL below pins a **4,000-row snapshot** internally. Sidebar values are for visibility only.")
+
 
 # ---------------- BigQuery client ----------------
 sa = dict(st.secrets["gcp_service_account"]); sa["private_key"] = sa["private_key"].replace("\\n","\n")
@@ -332,3 +332,4 @@ if submitted:
         "Price ratio vs category": round(price_ratio,2),
         "Account age (days)": int(acct_age)
     }]))
+
