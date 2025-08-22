@@ -1,5 +1,5 @@
 # app.py — run with: streamlit run app.py
-# Retail Fraud Dashboard — threshold slider only, full alerts, new-order decision
+# Retail Fraud Dashboard — THRESHOLD FIXED AT 0.50, full alerts, new-order decision
 
 import streamlit as st
 import pandas as pd
@@ -13,19 +13,19 @@ from sklearn.metrics import (
     precision_recall_curve, auc
 )
 
-# ───────────────────────────────────────────────────────── Page / Altair
+# ───────────────────────────────────────────────────────── Config / constants
 st.set_page_config("Retail Fraud Dashboard", layout="wide")
 alt.renderers.set_embed_options(actions=False)
+TH = 0.50  # <<< FIXED OPERATING THRESHOLD
 
-# ───────────────────────────────────────────────────────── Sidebar (threshold only)
+# ───────────────────────────────────────────────────────── Sidebar (no slider)
 with st.sidebar:
     st.header("BQ TABLE INFO")
     P  = st.text_input("Project", "mss-data-engineer-sandbox")
     D  = st.text_input("Dataset", "retail")
     PT = st.text_input("Predictions table", f"{P}.{D}.predictions_latest")
     FT = st.text_input("Features table",   f"{P}.{D}.features_signals_v4")
-    TH = st.slider("ALERT THRESHOLD (≥)", 0.00, 1.00, 0.30, 0.01)
-    st.caption("Threshold affects alerts, tables, and evaluation below.")
+    st.caption("Threshold is **fixed at 0.50** for all decisions and metrics.")
 
 # ───────────────────────────────────────────────────────── BigQuery client
 sa = dict(st.secrets["gcp_service_account"])
@@ -33,7 +33,7 @@ sa["private_key"] = sa["private_key"].replace("\\n", "\n")
 creds = service_account.Credentials.from_service_account_info(sa)
 bq = bigquery.Client(credentials=creds, project=creds.project_id)
 
-# ───────────────────────────────────────────────────────── Helpers (schema-aware & cache-safe)
+# ───────────────────────────────────────────────────────── Helpers (schema-aware)
 def _split_table_id(table_id: str):
     parts = table_id.split(".")
     if len(parts) != 3:
@@ -58,33 +58,27 @@ def get_columns(table_id: str) -> set:
 
 @st.cache_data(show_spinner=True)
 def load_df(pred_table: str, feat_table: str) -> pd.DataFrame:
-    """SAFE SELECT that only references columns that exist. No date filter."""
     pcols = get_columns(pred_table)
     fcols = get_columns(feat_table)
 
     sel = ["p.order_id"]
-    if "timestamp" in pcols:
-        sel.append("p.timestamp")
-    else:
-        sel.append("TIMESTAMP(NULL) AS timestamp")
-
+    sel.append("p.timestamp" if "timestamp" in pcols else "TIMESTAMP(NULL) AS timestamp")
     sel.append("CAST(p.fraud_score AS FLOAT64) AS fraud_score" if "fraud_score" in pcols
                else "CAST(0.0 AS FLOAT64) AS fraud_score")
 
-    # informational fields (shown in tables)
-    for c in ["customer_id","store_id","sku_id","sku_category",
-              "order_amount","quantity","payment_method",
-              "shipping_country","ip_country"]:
+    info_cols = ["customer_id","store_id","sku_id","sku_category",
+                 "order_amount","quantity","payment_method",
+                 "shipping_country","ip_country"]
+    for c in info_cols:
         sel.append(f"p.{c}" if c in pcols else f"CAST(NULL AS STRING) AS {c}")
 
-    # feature / strong-signal flags
     strongs = [
-        "strong_tri_mismatch_high_value", "strong_high_value_express_geo",
-        "strong_burst_multi_device", "strong_price_drop_bulk", "strong_giftcard_geo",
-        "strong_return_whiplash", "strong_price_inventory_stress", "strong_country_flip_express",
-        "high_price_anomaly", "low_price_anomaly",
-        "oversell_flag", "stockout_risk_flag", "hoarding_flag",
-        "fraud_flag"  # label if present
+        "strong_tri_mismatch_high_value","strong_high_value_express_geo",
+        "strong_burst_multi_device","strong_price_drop_bulk","strong_giftcard_geo",
+        "strong_return_whiplash","strong_price_inventory_stress","strong_country_flip_express",
+        "high_price_anomaly","low_price_anomaly",
+        "oversell_flag","stockout_risk_flag","hoarding_flag",
+        "fraud_flag"
     ]
 
     joins = ""
@@ -110,13 +104,10 @@ def load_df(pred_table: str, feat_table: str) -> pd.DataFrame:
     d = bq.query(sql).result().to_dataframe()
     d["timestamp"]   = pd.to_datetime(d["timestamp"], errors="coerce").dt.tz_localize(None)
     d["fraud_score"] = pd.to_numeric(d["fraud_score"], errors="coerce").fillna(0.0)
-
-    # simple derived helper if countries exist
     if {"shipping_country","ip_country"}.issubset(d.columns):
         d["geo_mismatch"] = (d["shipping_country"] != d["ip_country"]).astype(int)
     else:
         d["geo_mismatch"] = 0
-
     return d
 
 # ───────────────────────────────────────────────────────── Load & prepare
@@ -131,15 +122,12 @@ df["is_alert"] = (df["fraud_score"] >= TH).astype(int)
 st.title("Retail Fraud Dashboard")
 
 k1, k2, k3, k4 = st.columns([1,1,1,2])
-TOT = len(df)
-AL  = int(df["is_alert"].sum())
+TOT = len(df); AL = int(df["is_alert"].sum())
 k1.metric("TOTAL ROWS", TOT)
-k2.metric("ALERTS (≥ THRESHOLD)", AL)
+k2.metric("ALERTS (≥ 0.50)", AL)
 k3.metric("ALERT RATE", f"{(AL/TOT if TOT else 0):.2%}")
-win_text = ""
-if df["timestamp"].notna().any():
-    win_text = f"{df['timestamp'].min()} → {df['timestamp'].max()}"
-k4.caption(f"TABLE WINDOW: {win_text}  |  THRESHOLD = {TH:.2f}")
+win_text = f"{df['timestamp'].min()} → {df['timestamp'].max()}" if df["timestamp"].notna().any() else ""
+k4.caption(f"TABLE WINDOW: {win_text}  |  THRESHOLD = 0.50 (fixed)")
 st.markdown("---")
 
 # ───────────────────────────────────────────────────────── STRONG FEATURES (bold + meaning)
@@ -159,7 +147,7 @@ st.markdown("""
 """)
 
 # ───────────────────────────────────────────────────────── Score distribution
-st.subheader("Fraud Score Distribution")
+st.subheader("Fraud Score Distribution (red line at 0.50)")
 hist = alt.Chart(df).mark_bar().encode(
     x=alt.X("fraud_score:Q", bin=alt.Bin(maxbins=50), title="Fraud score"),
     y=alt.Y("count():Q", title="Rows"),
@@ -210,8 +198,8 @@ with c2:
         "Pricing / Inventory / Geo Context"
     )
 
-# ───────────────────────────────────────────────────────── ALL alerts (downloadable)
-st.subheader(f"All Alerts (score ≥ {TH:.2f})")
+# ───────────────────────────────────────────────────────── ALL alerts (download)
+st.subheader("All Alerts (score ≥ 0.50)")
 cols_show = [c for c in [
     "order_id","timestamp","customer_id","store_id","sku_id","sku_category",
     "order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score",
@@ -230,7 +218,7 @@ csv = alerts.loc[:, cols_show].to_csv(index=False).encode("utf-8")
 st.download_button("Download alerts (.csv)", csv, file_name="alerts.csv")
 
 # ───────────────────────────────────────────────────────── Model Evaluation
-st.subheader("Model Evaluation")
+st.subheader("Model Evaluation (TH = 0.50)")
 label_candidates = [c for c in ["fraud_flag","is_fraud","label","ground_truth","gt","y"] if c in df.columns]
 if label_candidates:
     lab = st.selectbox("Ground truth (1=fraud, 0=legit)", label_candidates, index=0)
@@ -242,22 +230,19 @@ else:
 
 y_score = df["fraud_score"].values
 
-# Recommended threshold (max F1)
 def best_threshold_f1(y_true, scores):
     ts = np.linspace(0.01, 0.99, 99)
     best_t, best_f = 0.5, -1
     for t in ts:
         y_hat = (scores >= t).astype(int)
         f = f1_score(y_true, y_hat, zero_division=0)
-        if f > best_f:
-            best_f, best_t = f, t
+        if f > best_f: best_f, best_t = f, t
     return float(best_t), float(best_f)
 
 t_star, f1_star = best_threshold_f1(y_true, y_score)
-st.caption(f"Recommended threshold for **max F1**: **{t_star:.2f}** (F1 ≈ {f1_star:.2%}). "
-           f"Current TH = {TH:.2f}.")
+st.caption(f"Recommended threshold for **max F1** (for reference): **{t_star:.2f}** (F1 ≈ {f1_star:.2%}). "
+           "Production decisions remain fixed at **0.50**.")
 
-# Metrics at current TH
 y_pred = (y_score >= TH).astype(int)
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Accuracy",  f"{accuracy_score(y_true, y_pred):.2%}")
@@ -301,10 +286,11 @@ st.altair_chart(
 )
 
 # ───────────────────────────────────────────────────────── New Order — Instant Decision
-st.subheader("New Order — Instant Decision")
+st.subheader("New Order — Instant Decision (TH = 0.50)")
 
-# Use robust percentiles from your data to define "high value"
+# baselines for auto-feature logic
 p90_amt = float(np.nanpercentile(df["order_amount"], 90)) if "order_amount" in df else 200.0
+cat_means = df.groupby("sku_category")["order_amount"].mean().to_dict() if "order_amount" in df and "sku_category" in df else {}
 
 with st.form("new_order"):
     c1, c2, c3 = st.columns(3)
@@ -317,59 +303,60 @@ with st.form("new_order"):
     ship_c  = c5.selectbox("Shipping country", sorted(df["shipping_country"].dropna().unique()) if "shipping_country" in df else ["US","CA","UK","DE","IN"])
     ip_c    = c6.selectbox("IP country", sorted(df["ip_country"].dropna().unique()) if "ip_country" in df else ["US","CA","UK","DE","IN"])
 
-    st.markdown("**Optionally toggle strong signals your ops team observed for this order:**")
-    s1, s2, s3, s4 = st.columns(4)
-    f_tri      = s1.checkbox("strong_tri_mismatch_high_value", False)
-    f_hv_geo   = s2.checkbox("strong_high_value_express_geo", False)
-    f_burst    = s3.checkbox("strong_burst_multi_device", False)
-    f_drop     = s4.checkbox("strong_price_drop_bulk", False)
-
-    t1, t2, t3, t4 = st.columns(4)
-    f_gift      = t1.checkbox("strong_giftcard_geo", False)
-    f_whiplash  = t2.checkbox("strong_return_whiplash", False)
-    f_pr_inv    = t3.checkbox("strong_price_inventory_stress", False)
-    f_country   = t4.checkbox("strong_country_flip_express", False)
-
-    u1, u2, u3 = st.columns(3)
-    f_hi_price  = u1.checkbox("high_price_anomaly", False)
-    f_lo_price  = u2.checkbox("low_price_anomaly",  False)
-    f_inv_risk  = u3.checkbox("oversell/stockout/hoarding", False)
+    # Optional advanced overrides (kept hidden unless needed)
+    with st.expander("Advanced (optional): manually flag observed strong signals"):
+        adv_cols = ["strong_burst_multi_device","strong_giftcard_geo","strong_return_whiplash",
+                    "strong_price_inventory_stress","strong_country_flip_express"]
+        adv = {c: st.checkbox(c.replace("_"," "), False) for c in adv_cols}
 
     submitted = st.form_submit_button("Score order")
 
 if submitted:
     order_amount = qty * price
+    # auto-derived signals
     geo_mismatch = int(ship_c != ip_c)
-    # Auto-derive a couple of common flags from the form (business logic mirrors feature names)
-    auto_tri = int(geo_mismatch == 1 and order_amount >= p90_amt)
-    auto_drop = int(qty >= 3 and price > 0 and (order_amount / max(1.0, price*qty)) >= 1.0)  # placeholder
+    tri_mismatch_high_value = int(geo_mismatch == 1 and order_amount >= p90_amt)
 
-    # Build a compact explanation
-    triggers = []
-    if geo_mismatch:          triggers.append("geo_mismatch")
-    if auto_tri or f_tri:     triggers.append("tri_mismatch_high_value")
-    if f_hv_geo:              triggers.append("high_value_express_geo")
-    if f_burst:               triggers.append("burst_multi_device")
-    if auto_drop or f_drop:   triggers.append("price_drop_bulk")
-    if f_gift:                triggers.append("giftcard_geo")
-    if f_whiplash:            triggers.append("return_whiplash")
-    if f_pr_inv:              triggers.append("price_inventory_stress")
-    if f_country:             triggers.append("country_flip_express")
-    if f_hi_price:            triggers.append("high_price_anomaly")
-    if f_lo_price:            triggers.append("low_price_anomaly")
-    if f_inv_risk:            triggers.append("inventory_risk")
+    # category-based price anomaly (if we have baseline)
+    cat_mean = cat_means.get(sku_cat, max(1.0, np.nanmean(list(cat_means.values())) if cat_means else 100.0))
+    high_price_anomaly = int(order_amount >= 1.5 * cat_mean)
+    low_price_anomaly  = int(order_amount <= 0.5 * cat_mean)
 
-    # Simple transparent risk score: fraction of triggered strong signals
-    total_signals = 12
-    score = len(triggers) / total_signals
-    # Light nudge: +0.10 for geo_mismatch on high-value orders
-    if geo_mismatch and order_amount >= p90_amt:
-        score = min(1.0, score + 0.10)
+    # price drop bulk proxy
+    price_drop_bulk = int(qty >= 3 and low_price_anomaly == 1)
 
+    # compile all signals
+    signals = {
+        "geo_mismatch": geo_mismatch,
+        "tri_mismatch_high_value": tri_mismatch_high_value,
+        "high_price_anomaly": high_price_anomaly,
+        "low_price_anomaly": low_price_anomaly,
+        "price_drop_bulk": price_drop_bulk,
+        # optional manual flags from expander
+        "burst_multi_device": int('adv' in locals() and adv.get("strong_burst_multi_device", False)),
+        "giftcard_geo": int('adv' in locals() and adv.get("strong_giftcard_geo", False)),
+        "return_whiplash": int('adv' in locals() and adv.get("strong_return_whiplash", False)),
+        "price_inventory_stress": int('adv' in locals() and adv.get("strong_price_inventory_stress", False)),
+        "country_flip_express": int('adv' in locals() and adv.get("strong_country_flip_express", False)),
+    }
+
+    # simple transparent risk score based on signals
+    fired = [k for k,v in signals.items() if v == 1]
+    score = min(1.0, 0.10*signals["geo_mismatch"] +
+                      0.20*signals["tri_mismatch_high_value"] +
+                      0.15*signals["high_price_anomaly"] +
+                      0.15*signals["low_price_anomaly"] +
+                      0.15*signals["price_drop_bulk"] +
+                      0.25*int(any(signals[k] for k in ["burst_multi_device","giftcard_geo","return_whiplash",
+                                                        "price_inventory_stress","country_flip_express"])))
     decision = "Fraud" if score >= TH else "Not fraud"
-    st.markdown(f"### Decision: **{decision}**  ·  Model-like score ≈ **{score:.2f}**  (threshold = {TH:.2f})")
-    st.caption(f"Signals fired: {', '.join(triggers) if triggers else 'none'}  ·  "
-               f"Order amount: {order_amount:,.2f}  ·  Geo mismatch: {bool(geo_mismatch)}  ·  P90=${p90_amt:,.0f}")
 
-st.caption("This dashboard is schema-aware. Use the threshold slider to trade off precision/recall. "
-           "The **recommended threshold** shown above (max-F1) is a practical default.")
+    st.markdown(f"### Decision: **{decision}**  ·  Score ≈ **{score:.2f}**  (TH = 0.50)")
+    st.caption(
+        f"Signals fired: {', '.join(fired) if fired else 'none'}  ·  "
+        f"Order amount: {order_amount:,.2f}  ·  "
+        f"Geo mismatch: {bool(geo_mismatch)}  ·  "
+        f"Category mean ≈ {cat_mean:,.2f}  ·  P90 amount ≈ {p90_amt:,.0f}"
+    )
+
+st.caption("Threshold is fixed at **0.50** for a stable operating point. The recommended (max-F1) threshold is shown for context only.")
