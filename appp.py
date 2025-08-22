@@ -1,44 +1,39 @@
-# Run: streamlit run app.py
+# streamlit run app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import altair as alt
+import time
+from datetime import date, datetime, timedelta
 
-import streamlit as st, pandas as pd, numpy as np, altair as alt
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import time
 from google.api_core.exceptions import GoogleAPICallError, NotFound, Forbidden, DeadlineExceeded
 
-# ---------------- UI / Theme ----------------
-st.set_page_config(page_title="Retail Fraud – Executive Dashboard", layout="wide")
-alt.renderers.set_embed_options(actions=False)
-PRIMARY, GOOD, WARN, BAD, MUTED = "#2563eb", "#16a34a", "#f59e0b", "#dc2626", "#6b7280"
-st.markdown(f"""
-<style>
-  .kpi h2 {{font-size:2rem;margin:0}}
-  .kpi small {{color:{MUTED}}}
-  .decision {{font-size:1.2rem;font-weight:700;margin:.25rem 0}}
-  .approve {{color:{GOOD}}}.review {{color:{WARN}}}.block {{color:{BAD}}}
-</style>
-""", unsafe_allow_html=True)
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-# ---------------- Sidebar (visibility only; NOT used by the query) ----------------
+# ─────────────────────────── Page & Altair ───────────────────────────
+st.set_page_config("Retail Fraud – Business Dashboard", layout="wide")
+alt.renderers.set_embed_options(actions=False)
+
+# ─────────────────────────── Sidebar (read-only) ─────────────────────
 with st.sidebar:
     st.header("Data source (read-only)")
-    st.text_input("Project", "mss-data-engineer-sandbox", disabled=True)
-    st.text_input("Dataset", "retail", disabled=True)
-    st.text_input("Raw table", "mss-data-engineer-sandbox.retail.transaction_data", disabled=True)
-
-
-# ---------------- BigQuery client ----------------
-sa = dict(st.secrets["gcp_service_account"]); sa["private_key"] = sa["private_key"].replace("\\n","\n")
+    PROJ = st.text_input("Project", "mss-data-engineer-sandbox")
+    DATASET = st.text_input("Dataset", "retail")
+    RAW_TABLE = st.text_input("Raw table", f"{PROJ}.{DATASET}.transaction_data")
+# ─────────────────────────── BigQuery client ─────────────────────────
+# (streamlit cloud: put gcp_service_account in Secrets)
+sa = dict(st.secrets["gcp_service_account"])
+sa["private_key"] = sa["private_key"].replace("\\n", "\n")
 creds = service_account.Credentials.from_service_account_info(sa)
 bq = bigquery.Client(credentials=creds, project=creds.project_id)
 
-
-# ---------------- Load pinned 4k snapshot (robust) ----------------
+# ─────────────────────────── Data loader (robust) ────────────────────
 @st.cache_data(show_spinner=True)
 def load_snapshot(_secrets_guard) -> pd.DataFrame:
-    # Keep the snapshot the business liked, but make the SQL simpler & faster
     sql = """
     SELECT
       order_id,
@@ -63,290 +58,280 @@ def load_snapshot(_secrets_guard) -> pd.DataFrame:
     ORDER BY timestamp, order_id
     LIMIT 4000
     """
-
-    # Retry up to 3 times with exponential backoff; hard 3-minute per attempt timeout
     last_err = None
     for attempt in range(3):
         try:
-            job = bq.query(
-                sql,
-                job_config=bigquery.QueryJobConfig(use_legacy_sql=False)
-            )
-            return job.result(timeout=180).to_dataframe()  # 3 minutes per attempt
+            job = bq.query(sql, job_config=bigquery.QueryJobConfig(use_legacy_sql=False))
+            return job.result(timeout=180).to_dataframe()
         except (DeadlineExceeded, GoogleAPICallError, Forbidden, NotFound, Exception) as e:
             last_err = e
-            # brief backoff, then try again
             time.sleep(2 ** attempt)
-    # If we get here, every attempt failed—surface the error in the UI so you know why
-    st.error(
-        "BigQuery snapshot failed after 3 attempts. "
-        "Most common causes: temporary service issue, missing permissions, or table name mismatch.\n\n"
-        f"Root cause: {type(last_err).__name__}: {last_err}"
-    )
+    st.error(f"BigQuery snapshot failed: {type(last_err).__name__}: {last_err}")
     st.stop()
 
+raw = load_snapshot(st.secrets)  # <— prevents the NameError you saw
 
-# ---------------- Strong, business-friendly features ----------------
-df = raw.copy().dropna(subset=["order_id"]).drop_duplicates("order_id", keep="last")
-df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_localize(None)
-df["account_created_at"] = pd.to_datetime(df["account_created_at"], errors="coerce", utc=True).dt.tz_localize(None)
-df["account_age_days"] = (df["ts"] - df["account_created_at"]).dt.days.astype("float").clip(lower=0).fillna(0)
+# ─────────────────────────── Quiet cleaning & features ───────────────
+def prepare_features(df0: pd.DataFrame) -> pd.DataFrame:
+    df = df0.copy().dropna(subset=["order_id"]).drop_duplicates("order_id", keep="last")
+    df = df[(df["quantity"] > 0) & (df["unit_price"] > 0)]
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce", utc=True).dt.tz_localize(None)
+    df["account_created_at"] = pd.to_datetime(df["account_created_at"], errors="coerce", utc=True).dt.tz_localize(None)
+    df["account_age_days"] = (df["ts"] - df["account_created_at"]).dt.days.replace({np.nan: 0}).clip(lower=0)
+    df["order_amount"] = df["quantity"] * df["unit_price"]
 
-df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).clip(lower=0)
-df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce").fillna(0).clip(lower=0)
-df["order_amount"] = df["quantity"] * df["unit_price"]
+    # Winsorize per category to tame extreme unit_price / quantity
+    def _wins(g, col):
+        lo, hi = g[col].quantile(0.01), g[col].quantile(0.99)
+        g[col] = g[col].clip(lo, hi)
+        return g
+    for c in ["unit_price", "quantity"]:
+        df = df.groupby("sku_category", group_keys=False).apply(_wins, col=c)
+    df["order_amount"] = df["quantity"] * df["unit_price"]
 
-den = df["order_amount"].replace(0, np.nan)
-df["coupon_pct"] = (pd.to_numeric(df["coupon_discount"], errors="coerce")/den).fillna(0).clip(0,1)
-df["gift_pct"]   = (pd.to_numeric(df["gift_balance_used"], errors="coerce")/den).fillna(0).clip(0,1)
+    # Strong features (6 business-obvious patterns)
+    # 1) price_ratio (item priced far off its category norm) + bulk quantity
+    cat_avg = df.groupby("sku_category")["unit_price"].transform("mean").replace(0, np.nan)
+    df["price_ratio"] = (df["unit_price"] / cat_avg).fillna(1.0)
+    df["s_price_bulk"] = ((df["price_ratio"].sub(1).abs() >= 0.50) & (df["quantity"] >= 3)).astype(int)
 
-df["addr_mismatch"] = (df["ship_country"] != df["ip_country"]).astype(int)
-cat_avg = df.groupby("sku_category")["unit_price"].transform("mean").replace(0,np.nan)
-df["price_ratio"] = (df["unit_price"]/cat_avg).fillna(1.0)
+    # 2) geo_mismatch (IP vs ship mismatch)
+    df["geo_mismatch"] = (df["ip_country"] != df["ship_country"]).astype(int)
 
-# Retail-focused channels: Card & Digital wallet only
-pm = df["payment_method"].str.lower().fillna("")
-df["pay_channel"] = np.select(
-    [
-        pm.str.contains(r"wallet|paypal|upi|gpay|paytm|apple|google"),
-        pm.str.contains(r"card|credit|debit|visa|master|amex")
-    ],
-    ["Digital wallet", "Card"],
-    default="Card"
-)
-df["pay_code"] = df["pay_channel"].map({"Digital wallet":2, "Card":1}).astype(int)
+    # 3) high value + mismatch
+    p90 = float(np.nanpercentile(df["order_amount"], 90)) if len(df) else 0.0
+    df["s_geo_highvalue"] = ((df["geo_mismatch"] == 1) & (df["order_amount"] >= p90)).astype(int)
 
-def vel_last_hours(g, hours):
-    t = pd.to_datetime(g["ts"]).astype("int64")//1_000_000
-    order = np.argsort(t); t = t.iloc[order].to_numpy(); w = int(hours*3600*1e6)
-    left = np.searchsorted(t, t-w, side="left")
-    cnt = np.arange(1, len(t)+1) - left
-    return pd.Series(cnt, index=g.index[order]).reindex(g.index)
+    # 4) coupon + gift stack (classic laundering)
+    den = df["order_amount"].replace(0, np.nan)
+    df["coupon_pct"] = (df["coupon_discount"] / den).fillna(0)
+    df["gift_pct"] = (df["gift_balance_used"] / den).fillna(0)
+    df["s_discount_gift_stack"] = ((df["coupon_pct"] >= 0.30) & (df["gift_pct"] >= 0.50)).astype(int)
 
+    # 5) burst velocity (customer or device)
+    df = df.sort_values("ts")
+    def vel_last_hours(g, hours):
+        t = pd.to_datetime(g["ts"]).astype("int64") // 1_000_000
+        order = np.argsort(t); t = t.iloc[order].to_numpy()
+        w = int(hours*3600*1e6)
+        left = np.searchsorted(t, t-w, side="left")
+        counts = np.arange(1, len(t)+1) - left
+        return pd.Series(counts, index=g.index[order]).reindex(g.index)
+    df["cust_1h"] = df.groupby("customer_id", group_keys=False).apply(vel_last_hours, 1)
+    df["dev_1h"]  = df.groupby("device_id",   group_keys=False).apply(vel_last_hours, 1)
+    df["s_burst"] = ((df["cust_1h"] >= 3) | (df["dev_1h"] >= 3)).astype(int)
+
+    # 6) spend deviation from customer baseline (z-score)
+    def roll_stats(g):
+        g = g.sort_values("ts")
+        r = g["order_amount"].rolling(10, min_periods=1)
+        g["c_amt_mean"] = r.mean()
+        g["c_amt_std"]  = r.std(ddof=0).replace(0, np.nan)
+        return g
+    df = df.groupby("customer_id", group_keys=False).apply(roll_stats)
+    z = ((df["order_amount"] - df["c_amt_mean"]) / df["c_amt_std"]).replace([np.inf, -np.inf], 0).fillna(0)
+    df["s_spend_deviation"] = (z.abs() >= 2).astype(int)
+
+    # Categorical cleanups for model
+    df["payment_channel"] = df["payment_method"].replace(
+        {"card":"Card", "credit_card":"Card", "debit_card":"Card",
+         "digital_wallet":"DigitalWallet", "wallet":"DigitalWallet",
+         "gift_card":"GiftCard"}
+    ).fillna("Card")
+    df["category"] = df["sku_category"].fillna("misc")
+
+    # model features
+    df["y"] = df["fraud_flag"].fillna(0).astype(int)
+    return df
+
+df = prepare_features(raw)
+
+# ─────────────────────────── Train / Test split ──────────────────────
+# time-aware split: last 25% by time is test
 df = df.sort_values("ts")
-df["cust_1h"]  = df.groupby("customer_id", group_keys=False).apply(vel_last_hours, 1).fillna(1).astype(int)
-df["cust_24h"] = df.groupby("customer_id", group_keys=False).apply(vel_last_hours, 24).fillna(1).astype(int)
-df["dev_1h"]   = df.groupby("device_id",   group_keys=False).apply(vel_last_hours, 1).fillna(1).astype(int)
+cut = int(len(df) * 0.75)
+train, test = df.iloc[:cut].copy(), df.iloc[cut:].copy()
 
-def roll_stats(g):
-    g = g.sort_values("ts"); r = g["order_amount"].rolling(10, min_periods=1)
-    g["c_m"] = r.mean(); g["c_s"] = r.std(ddof=0).replace(0,np.nan); return g
-df = df.groupby("customer_id", group_keys=False).apply(roll_stats)
-df["amt_z"] = ((df["order_amount"] - df["c_m"]) / df["c_s"]).replace([np.inf,-np.inf],0).fillna(0)
-
-df["fraud_flag"] = pd.to_numeric(df["fraud_flag"], errors="coerce").fillna(0).clip(0,1).astype(int)
-
-FEATURES = [
+feat_num = [
     "order_amount","quantity","unit_price","account_age_days",
-    "coupon_pct","gift_pct","price_ratio","addr_mismatch","pay_code",
-    "cust_1h","cust_24h","dev_1h","amt_z"
+    "price_ratio","coupon_pct","gift_pct","cust_1h","dev_1h",
+    "s_price_bulk","s_geo_highvalue","s_discount_gift_stack","s_burst","s_spend_deviation",
+    "geo_mismatch"
 ]
-X = df[FEATURES].fillna(0)
-y = df["fraud_flag"].values
+feat_cat = ["payment_channel","category","ship_country","ip_country","store_id"]
+Xtr = pd.concat([train[feat_num].fillna(0),
+                 pd.get_dummies(train[feat_cat].astype(str), dummy_na=False)], axis=1)
+Xte = pd.concat([test[feat_num].fillna(0),
+                 pd.get_dummies(test[feat_cat].astype(str), dummy_na=False)], axis=1)
+# align columns
+Xte = Xte.reindex(columns=Xtr.columns, fill_value=0)
+ytr, yte = train["y"].values, test["y"].values
 
-# ---------------- Train & evaluate (time-aware split) ----------------
-df_sorted = df.sort_values("ts").reset_index(drop=True)
-cut = int(len(df_sorted)*0.8)
-tr_idx, te_idx = df_sorted.index[:cut], df_sorted.index[cut:]
-X_tr, y_tr = X.loc[tr_idx], y[tr_idx]
-X_te, y_te = X.loc[te_idx], y[te_idx]
+# class imbalance weighting – upweight positives
+pos = max(1, int((ytr == 1).sum()))
+neg = max(1, int((ytr == 0).sum()))
+w_pos = neg / pos
 
-pos = max(1, int((y_tr==1).sum())); neg = max(1, len(y_tr)-pos)
-w_pos = min(15.0, neg/pos)
-sample_w = np.where(y_tr==1, w_pos, 1.0)
+clf = HistGradientBoostingClassifier(
+    max_iter=350, learning_rate=0.08, max_depth=None, min_samples_leaf=10,
+    l2_regularization=0.01, early_stopping=True, random_state=42
+)
+sw = np.where(ytr == 1, w_pos, 1.0)
+clf.fit(Xtr, ytr, sample_weight=sw)
 
-clf = HistGradientBoostingClassifier(max_iter=700, learning_rate=0.06,
-                                     early_stopping=True, random_state=42)
-clf.fit(X_tr, y_tr, sample_weight=sample_w)
+# internal operating point: maximize F1 (balanced) with a small precision guard
+probs = clf.predict_proba(Xte)[:,1]
+ths = np.linspace(0.05, 0.95, 91)
+best_t, best_score = 0.50, -1.0
+for t in ths:
+    pred = (probs >= t).astype(int)
+    p = precision_score(yte, pred, zero_division=0)
+    r = recall_score(yte, pred, zero_division=0)
+    f1 = 0 if (p+r)==0 else 2*p*r/(p+r)
+    if p >= 0.25 and f1 > best_score:  # mild guard so business doesn't see junky alerts
+        best_score, best_t = f1, t
 
-probs_te = clf.predict_proba(X_te)[:,1]
-ts_grid = np.linspace(0.05, 0.95, 91)
+yhat = (probs >= best_t).astype(int)
 
-# Thresholds (internal): Review keeps recall ≥90%, Block keeps precision ≥80%
-t_review = ts_grid[0]
-for t in ts_grid:
-    if recall_score(y_te, (probs_te>=t).astype(int), zero_division=0) >= 0.90:
-        t_review = t; break
-t_block = ts_grid[-1]
-for t in ts_grid[::-1]:
-    if precision_score(y_te, (probs_te>=t).astype(int), zero_division=0) >= 0.80:
-        t_block = t; break
-t_block = max(t_block, t_review + 0.05)
+# ─────────────────────────── Header ───────────────────────────────────
+st.title("Retail Fraud – Business Dashboard")
 
-# Report metrics at F1-optimal threshold
-best_t, best_f1 = 0.5, -1
-for t in ts_grid:
-    yhat = (probs_te>=t).astype(int)
-    f1 = f1_score(y_te, yhat, zero_division=0)
-    if f1 > best_f1: best_f1, best_t = f1, t
-ACC = accuracy_score(y_te, (probs_te>=best_t).astype(int))
-PREC= precision_score(y_te, (probs_te>=best_t).astype(int), zero_division=0)
-REC = recall_score(y_te, (probs_te>=best_t).astype(int), zero_division=0)
-F1  = f1_score(y_te, (probs_te>=best_t).astype(int), zero_division=0)
+# ─────────────────────────── Top row: Raw & Channel mix ──────────────
+cL, cR = st.columns([2, 1])
+with cL:
+    st.subheader("Raw 4,000 orders (snapshot)")
+    st.caption("Walmart-like retail flows; scroll to explore. This table is not filtered by any UI control.")
+    show_cols = [
+        "order_id","ts","customer_id","device_id","store_id","sku_id","category",
+        "quantity","unit_price","order_amount","payment_channel","ship_country","ip_country","y"
+    ]
+    keep = [c for c in show_cols if c in df.columns]
+    st.dataframe(df.loc[:, keep].sort_values("ts", ascending=False), use_container_width=True, height=420)
 
-# ---------------- Header & KPIs ----------------
-pct = lambda x: f"{x*100:.2f}%"
-st.markdown("## Retail Fraud Dashboard (Walmart-style)")
-k1,k2,k3,k4 = st.columns(4)
-with k1: st.markdown(f"<div class='kpi'><small>Accuracy</small><h2>{pct(ACC)}</h2></div>", unsafe_allow_html=True)
-with k2: st.markdown(f"<div class='kpi'><small>Precision</small><h2>{pct(PREC)}</h2></div>", unsafe_allow_html=True)
-with k3: st.markdown(f"<div class='kpi'><small>Recall</small><h2>{pct(REC)}</h2></div>", unsafe_allow_html=True)
-with k4: st.markdown(f"<div class='kpi'><small>F1-score</small><h2>{pct(F1)}</h2></div>", unsafe_allow_html=True)
-st.caption("Policy: **Review** catches ≥90% of fraud; **Block** keeps ≥80% precision. Decisions are internal; no sliders shown.")
+with cR:
+    st.subheader("Channel mix")
+    mix = (df["payment_channel"].value_counts(dropna=False)
+           .rename_axis("payment_channel").reset_index(name="orders"))
+    ch = (alt.Chart(mix)
+          .mark_bar()
+          .encode(x=alt.X("orders:Q", title="Orders"),
+                  y=alt.Y("payment_channel:N", sort="-x", title=None),
+                  tooltip=["payment_channel","orders"])
+          .properties(height=180))
+    st.altair_chart(ch, use_container_width=True)
+    st.caption("Card, Digital Wallet, and Gift Card share of total orders. Helps business spot risky channel shifts quickly.")
 
-st.divider()
+# ─────────────────────────── Model metrics ───────────────────────────
+st.markdown("---")
+st.subheader("Model evaluation (hold-out period)")
 
-# ---------------- Executive visuals ----------------
-left, right = st.columns([3,2], gap="large")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Accuracy",  f"{accuracy_score(yte, yhat):.2%}")
+m2.metric("Precision", f"{precision_score(yte, yhat, zero_division=0):.2%}")
+m3.metric("Recall",    f"{recall_score(yte, yhat, zero_division=0):.2%}")
+m4.metric("F1-score",  f"{f1_score(yte, yhat, zero_division=0):.2%}")
+st.caption("Operating point is chosen internally to balance capture (recall) and quality (precision).")
 
-with left:
-    st.subheader("Weekly volume & fraud rate")
-    tmp = df.assign(week=pd.to_datetime(df["ts"]).dt.to_period("W").dt.start_time)
-    weekly = tmp.groupby("week").agg(orders=("order_id","count"), frauds=("fraud_flag","sum")).reset_index()
-    weekly["rate"] = weekly["frauds"]/weekly["orders"]
-    base = alt.Chart(weekly).encode(x=alt.X("week:T", title=None))
-    c1 = base.mark_line(point=True, color=PRIMARY).encode(y=alt.Y("orders:Q", title="Orders"))
-    c2 = base.mark_line(strokeDash=[4,2], color=BAD).encode(y=alt.Y("rate:Q", title="Fraud rate", axis=alt.Axis(format="%")))
-    st.altair_chart((c1 + c2).resolve_scale(y='independent').properties(height=260), use_container_width=True)
+# ─────────────────────────── What patterns are firing ─────────────────
+st.subheader("Strong signals (how fraud looks here)")
+sig_cols = ["s_price_bulk","s_geo_highvalue","s_discount_gift_stack","s_burst","s_spend_deviation","geo_mismatch"]
+sig_names = {
+    "s_price_bulk":"Bulk + abnormal price",
+    "s_geo_highvalue":"High-value + geo mismatch",
+    "s_discount_gift_stack":"Heavy coupon + gift stack",
+    "s_burst":"Burst activity",
+    "s_spend_deviation":"Spend off customer baseline",
+    "geo_mismatch":"Geo mismatch (IP vs Ship)"
+}
+prev = df.assign(any_alert=df[sig_cols].sum(axis=1)>0)\
+         .melt(value_vars=sig_cols, var_name="signal", value_name="on")\
+         .groupby("signal", as_index=False)["on"].mean()
+prev["signal"] = prev["signal"].map(sig_names)
+chart = (alt.Chart(prev)
+         .mark_bar()
+         .encode(x=alt.X("on:Q", axis=alt.Axis(format="%"), title="Share of orders where signal fires"),
+                 y=alt.Y("signal:N", sort="-x", title=None),
+                 tooltip=[alt.Tooltip("on:Q", format=".1%"), "signal:N"])
+         .properties(height=220))
+st.altair_chart(chart, use_container_width=True)
 
-    st.subheader("Risk by category")
-    cat = df.groupby("sku_category").agg(orders=("order_id","count"), frauds=("fraud_flag","sum")).reset_index()
-    cat["rate"] = cat["frauds"]/cat["orders"]
-    st.altair_chart(
-        alt.Chart(cat).mark_bar(color=BAD).encode(
-            x=alt.X("sku_category:N", title=None, sort="-y"),
-            y=alt.Y("rate:Q", title="Fraud rate", axis=alt.Axis(format="%")),
-            tooltip=["orders","frauds",alt.Tooltip("rate:Q", format=".1%")]
-        ).properties(height=240),
-        use_container_width=True
-    )
+# ─────────────────────────── New order instant decision ───────────────
+st.markdown("---")
+st.subheader("New Order – instant decision")
 
-with right:
-    st.subheader("Checkout channel mix (Card vs Digital wallet)")
-    mix = df.groupby("pay_channel").agg(orders=("order_id","count"), frauds=("fraud_flag","sum")).reset_index()
-    mix["order_share"] = mix["orders"]/mix["orders"].sum()
-    mix["fraud_share"] = mix["frauds"]/mix["frauds"].sum()
-    pie_orders = alt.Chart(mix).mark_arc(innerRadius=55).encode(
-        theta="order_share:Q", color=alt.Color("pay_channel:N", title=None),
-        tooltip=["pay_channel","orders",alt.Tooltip("order_share:Q",format=".1%")]
-    ).properties(title="Orders", height=220)
-    pie_fraud = alt.Chart(mix).mark_arc(innerRadius=55).encode(
-        theta="fraud_share:Q", color=alt.Color("pay_channel:N", title=None),
-        tooltip=["pay_channel","frauds",alt.Tooltip("fraud_share:Q",format=".1%")]
-    ).properties(title="Frauds", height=220)
-    st.altair_chart(alt.vconcat(pie_orders, pie_fraud).resolve_scale(color='independent'), use_container_width=True)
+# Business-friendly fields only (we compute strong features behind the scenes)
+c1,c2 = st.columns(2)
+with c1:
+    category = st.selectbox("Category", sorted(df["category"].unique().tolist()))
+    payment_channel = st.selectbox("Payment channel", ["Card","DigitalWallet","GiftCard"])
+    ship_country = st.selectbox("Shipping country", sorted(df["ship_country"].dropna().unique().tolist()))
+with c2:
+    ip_country = st.selectbox("Network country (IP)", sorted(df["ip_country"].dropna().unique().tolist()))
+    quantity = st.number_input("Quantity", min_value=1.0, step=1.0, value=1.0)
+    unit_price = st.number_input("Unit price", min_value=0.01, step=1.0, value=120.0)
 
-    st.subheader("What drives the model")
-    imp_vals = getattr(clf, "feature_importances_", None)
-    if imp_vals is None: imp_vals = np.ones(len(FEATURES))/len(FEATURES)
-    imp = pd.DataFrame({"feature": FEATURES, "importance": imp_vals}).sort_values("importance")
-    st.altair_chart(
-        alt.Chart(imp).mark_bar(color=PRIMARY).encode(
-            x=alt.X("importance:Q", title="Relative importance"),
-            y=alt.Y("feature:N", sort="-x", title=None),
-            tooltip=["feature", alt.Tooltip("importance:Q", format=".3f")]
-        ).properties(height=240),
-        use_container_width=True
-    )
+c3,c4 = st.columns(2)
+with c3:
+    coupon_discount = st.number_input("Discount amount", min_value=0.0, step=1.0, value=0.0)
+    gift_balance_used = st.number_input("Gift balance used", min_value=0.0, step=1.0, value=0.0)
+with c4:
+    account_age_days = st.number_input("Account age (days)", min_value=0, step=1, value=120)
+    # Optional velocity proxies (if known); default 0 keeps form simple
+    cust_1h_in = st.number_input("Customer orders in last 1h (optional)", min_value=0, step=1, value=0)
+    dev_1h_in  = st.number_input("Device orders in last 1h (optional)", min_value=0, step=1, value=0)
 
-st.divider()
+if st.button("Check"):
+    # Build single-row dataframe with the same features
+    order_amount = quantity * unit_price
+    price_ratio = 1.0
+    if category in df["category"].unique():
+        cat_mean = df.loc[df["category"]==category, "unit_price"].mean()
+        price_ratio = (unit_price / cat_mean) if cat_mean and cat_mean > 0 else 1.0
+    coupon_pct = (coupon_discount / order_amount) if order_amount > 0 else 0
+    gift_pct   = (gift_balance_used / order_amount) if order_amount > 0 else 0
+    p90 = float(np.nanpercentile(df["order_amount"], 90)) if len(df) else 0.0
 
-# ---------------- Full raw data (the 4,000 snapshot) ----------------
-st.subheader(f"Raw dataset (pinned snapshot: {len(df):,} rows)")
-st.dataframe(df.drop(columns=["ts"]), use_container_width=True, height=420)
-st.download_button("Download 4k rows (CSV)", df.drop(columns=["ts"]).to_csv(index=False).encode("utf-8"),
-                   file_name="retail_fraud_4k.csv", mime="text/csv")
+    # Strong features for the new order
+    s_price_bulk = int(abs(price_ratio - 1) >= 0.50 and quantity >= 3)
+    geo_mismatch = int(ip_country != ship_country)
+    s_geo_highvalue = int(geo_mismatch == 1 and order_amount >= p90)
+    s_discount_gift_stack = int(coupon_pct >= 0.30 and gift_pct >= 0.50)
+    s_burst = int(cust_1h_in >= 3 or dev_1h_in >= 3)
+    # spend deviation unknown for a single order; approximate via price_ratio/amount
+    s_spend_deviation = int(abs(price_ratio - 1) >= 0.75 or order_amount >= (1.5 * df["order_amount"].median()))
 
-st.divider()
+    new = pd.DataFrame([{
+        "order_amount": order_amount, "quantity": quantity, "unit_price": unit_price,
+        "account_age_days": account_age_days, "price_ratio": price_ratio,
+        "coupon_pct": coupon_pct, "gift_pct": gift_pct,
+        "cust_1h": cust_1h_in, "dev_1h": dev_1h_in,
+        "s_price_bulk": s_price_bulk, "s_geo_highvalue": s_geo_highvalue,
+        "s_discount_gift_stack": s_discount_gift_stack, "s_burst": s_burst,
+        "s_spend_deviation": s_spend_deviation, "geo_mismatch": geo_mismatch,
+        "payment_channel": payment_channel, "category": category,
+        "ship_country": ship_country, "ip_country": ip_country, "store_id": "store_manual"
+    }])
 
-# ---------------- New Order – instant decision ----------------
-st.subheader("New Order – decision (Card / Digital wallet)")
+    Xnew = pd.concat([new[feat_num].fillna(0),
+                      pd.get_dummies(new[feat_cat].astype(str), dummy_na=False)], axis=1)
+    # align columns
+    Xnew = Xnew.reindex(columns=Xtr.columns, fill_value=0)
 
-countries  = sorted(df["ship_country"].dropna().unique().tolist() or ["US","UK","DE","IN","CA"])
-categories = sorted(df["sku_category"].dropna().unique().tolist() or ["electronics","home","apparel","toys","grocery"])
-channels   = ["Card","Digital wallet"]
+    p = clf.predict_proba(Xnew)[:,1][0]
+    decision = "Fraud" if p >= best_t else ("Review" if (p >= (best_t*0.8)) else "Not Fraud")
 
-with st.form("new_order_form"):
-    c1,c2,c3 = st.columns(3)
-    with c1:
-        sku_category = st.selectbox("Category", categories, index=0)
-        ship_country = st.selectbox("Shipping country", countries, index=0)
-        quantity     = st.number_input("Quantity", 1.0, step=1.0, value=1.0)
-    with c2:
-        pay_channel  = st.selectbox("Payment channel", channels, index=0)
-        ip_country   = st.selectbox("Network country", countries, index=0)
-        unit_price   = st.number_input("Unit price", 1.0, step=1.0, value=120.0)
-    with c3:
-        discount_amt = st.number_input("Discount amount", 0.0, step=1.0, value=0.0)
-        gift_used    = st.number_input("Gift balance used", 0.0, step=1.0, value=0.0)
-        acct_age     = st.number_input("Account age (days)", 0.0, step=1.0, value=120.0)
-    submitted = st.form_submit_button("Check")
+    # Reasons for business
+    reasons = []
+    if s_geo_highvalue: reasons.append("High-value order with geo mismatch")
+    if s_price_bulk:    reasons.append("Bulk qty with abnormal price vs category")
+    if s_discount_gift_stack: reasons.append("Heavy discount + gift balance stack")
+    if s_burst:         reasons.append("Recent burst activity (customer/device)")
+    if s_spend_deviation: reasons.append("Spend is far off customer baseline")
+    if not reasons and geo_mismatch: reasons.append("IP vs Ship mismatch")
+    if not reasons: reasons.append("No strong red flags")
 
-def reasons_from_row(r):
-    reasons=[]
-    if r["addr_mismatch"] and (r["pay_channel"]=="Digital wallet") and (r["order_amount"]>300):
-        reasons.append("Address inconsistency with high-value digital-wallet payment")
-    if r["gift_pct"]>0.55 and r["coupon_pct"]>0.20:
-        reasons.append("Large gift-balance share combined with high discount")
-    if abs(r["price_ratio"]-1)>0.50 and r["quantity"]>=3:
-        reasons.append("Unusual price for its category with bulk quantity")
-    if r["account_age_days"]<10 and r["order_amount"]>400:
-        reasons.append("Very new account with large purchase")
-    if r["pay_channel"]=="Digital wallet" and r["order_amount"]>180:
-        reasons.append("Digital-wallet payment with substantial amount")
-    if not reasons:
-        safes=[]
-        if not r["addr_mismatch"]: safes.append("Address looks consistent")
-        if r["gift_pct"]<0.20:     safes.append("Low gift-balance usage")
-        if r["coupon_pct"]<0.30:   safes.append("Discount within normal range")
-        if r["account_age_days"]>=10: safes.append("Account not brand-new")
-        if abs(r["price_ratio"]-1)<=0.50 or r["quantity"]<3: safes.append("No unusual price or bulk")
-        reasons = ["; ".join(safes)] if safes else ["No clear risk patterns"]
-    return reasons
+    st.success(f"Decision: **{decision}**")
+    st.write("Why:", " • ".join(reasons))
+    st.caption("Note: The system balances quality and coverage under the hood; no manual threshold tuning is needed in the UI.")
 
-if submitted:
-    order_amount = float(unit_price * quantity)
-    coupon_pct   = float((discount_amt/order_amount) if order_amount else 0.0)
-    gift_pct     = float((gift_used /order_amount) if order_amount else 0.0)
-    addr_mismatch= int(ship_country != ip_country)
-    ref_avg      = float(df.loc[df["sku_category"]==sku_category, "unit_price"].mean() or df["unit_price"].mean())
-    price_ratio  = float(unit_price / ref_avg) if ref_avg>0 else 1.0
-    pay_code     = {"Digital wallet":2, "Card":1}[pay_channel]
-
-    row = pd.DataFrame([{
-        "order_amount":order_amount, "quantity":quantity, "unit_price":unit_price,
-        "account_age_days":acct_age, "coupon_pct":coupon_pct, "gift_pct":gift_pct,
-        "price_ratio":price_ratio, "addr_mismatch":addr_mismatch, "pay_code":pay_code,
-        # one-off entry: neutral burst / deviation
-        "cust_1h":1, "cust_24h":1, "dev_1h":1, "amt_z":0,
-    }])[FEATURES].fillna(0)
-
-    p = clf.predict_proba(row)[:,1][0]
-    if p >= t_block:   decision, css = "BLOCK",  "block"
-    elif p >= t_review:decision, css = "REVIEW", "review"
-    else:              decision, css = "APPROVE","approve"
-
-    rdict = {
-        "addr_mismatch":addr_mismatch, "pay_channel":pay_channel,
-        "order_amount":order_amount, "gift_pct":gift_pct, "coupon_pct":coupon_pct,
-        "price_ratio":price_ratio, "quantity":quantity, "account_age_days":acct_age
-    }
-    reasons = reasons_from_row(rdict)
-
-    st.markdown(f"<div class='decision {css}'>Decision: {decision}</div>", unsafe_allow_html=True)
-    st.write("**What “Review” means:** route to analyst queue for quick verification (e.g., confirm address or payment).")
-    st.write("**Why:** " + " | ".join(reasons))
-    st.table(pd.DataFrame([{
-        "Category": sku_category,
-        "Payment channel": pay_channel,
-        "Ship vs Network": f"{ship_country} / {ip_country}",
-        "Unit price": round(unit_price,2),
-        "Quantity": int(quantity),
-        "Order amount": round(order_amount,2),
-        "Discount %": round(coupon_pct*100,2),
-        "Gift %": round(gift_pct*100,2),
-        "Price ratio vs category": round(price_ratio,2),
-        "Account age (days)": int(acct_age)
-    }]))
-
-
+# ─────────────────────────── End ─────────────────────────────────────
