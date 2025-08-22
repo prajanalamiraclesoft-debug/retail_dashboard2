@@ -203,7 +203,6 @@ h = min(720, max(240, 28 * (len(alerts) if len(alerts) < 20 else 20)))
 st.dataframe(alerts, use_container_width=True, height=h)
 
 # ───────────────────────── Model Evaluation ─────────────────────────
-# ───────────────────────── Model Evaluation ─────────────────────────
 st.subheader("Model Evaluation")
 
 # Prefer a real ground-truth column if present; otherwise fall back to decisions
@@ -216,44 +215,27 @@ else:
     st.warning("No label column found; using current decisions as a proxy.")
     y_true = df["is_alert"].values
 
-y_pred  = df["is_alert"].values
-y_score = df["fraud_score"].values  # kept for possible future diagnostics
+y_pred = df["is_alert"].values
 
-# Headline KPIs
-c_acc, c_prec, c_rec, c_f1 = st.columns(4)
-c_acc.metric("Accuracy",  f"{accuracy_score(y_true, y_pred):.2%}")
-c_prec.metric("Precision", f"{precision_score(y_true, y_pred, zero_division=0):.2%}")
-c_rec.metric("Recall",    f"{recall_score(y_true, y_pred, zero_division=0):.2%}")
-c_f1.metric("F1-score",   f"{f1_score(y_true, y_pred, zero_division=0):.2%}")
+# KPIs only (no charts)
+acc  = accuracy_score(y_true, y_pred)
+prec = precision_score(y_true, y_pred, zero_division=0)
+rec  = recall_score(y_true, y_pred, zero_division=0)
+f1   = f1_score(y_true, y_pred, zero_division=0)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Accuracy",  f"{acc:.2%}")
+c2.metric("Precision", f"{prec:.2%}")
+c3.metric("Recall",    f"{rec:.2%}")
+c4.metric("F1-score",  f"{f1:.2%}")
 
 # Short, plain-English explanations (business-facing)
 st.caption(
     "• **Accuracy**: share of all orders where the decision matched the label.  "
-    "• **Precision**: among the orders we flagged, how many were truly fraud (cleanliness of alerts).  "
+    "• **Precision**: among orders we flagged, how many were truly fraud (cleanliness of alerts).  "
     "• **Recall**: share of all true fraud that we actually caught (miss-rate complement).  "
     "• **F1**: single score balancing precision and recall when classes are imbalanced."
 )
-
-# Confusion matrix heatmap (kept)
-cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-cm_long = (
-    pd.DataFrame(cm, index=["Actual: 0 (legit)", "Actual: 1 (fraud)"], columns=["Pred: 0", "Pred: 1"])
-      .reset_index()
-      .melt(id_vars="index", var_name="Predicted", value_name="Count")
-      .rename(columns={"index": "Actual"})
-)
-
-st.altair_chart(
-    alt.Chart(cm_long).mark_rect().encode(
-        x="Predicted:N",
-        y="Actual:N",
-        color=alt.Color("Count:Q", scale=alt.Scale(scheme="blues")),
-        tooltip=["Actual", "Predicted", "Count"]
-    ).properties(height=180),
-    use_container_width=True
-)
-
-# Note: intentionally removed ROC/AUC and Precision–Recall curves for a cleaner, simpler panel.
 
 # ───────────────────────── New Order — Instant Decision ─────────────────────────
 st.markdown("## New Order — Instant Decision")
@@ -382,4 +364,5 @@ if st.button("Score order"):
         f"P90 amount ≈ {expl['cat_p90']:,.2f} · "
         f"Geo mismatch: {'Yes' if expl['geo_mismatch'] else 'No'}."
     )
+
 
