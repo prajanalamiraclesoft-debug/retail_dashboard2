@@ -3,12 +3,12 @@ import streamlit as st, pandas as pd, numpy as np, altair as alt
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-st.set_page_config("Retail Fraud – Business Demo", layout="wide")
+st.set_page_config("Retail Fraud", layout="wide")
 alt.renderers.set_embed_options(actions=False)
 RND = 42
 
 # ───────────────── Sidebar (read-only source) ─────────────────
-st.sidebar.header("Data source (read-only)")
+st.sidebar.header("Data source")
 st.sidebar.text_input("Project", "mss-data-engineer-sandbox", disabled=True)
 st.sidebar.text_input("Dataset", "retail", disabled=True)
 st.sidebar.text_input("Raw table", "mss-data-engineer-sandbox.retail.transaction_data", disabled=True)
@@ -81,7 +81,7 @@ best_t = 0.3
 yhat = (probs >= best_t).astype(int)
 
 # ───────────────── Dashboard Layout ─────────────────
-st.title("Retail Fraud Detection – Walmart Style")
+st.title("Retail Fraud Detection")
 
 # Raw data
 st.subheader("📦 Raw 4,000 Transactions Snapshot")
@@ -142,3 +142,4 @@ if st.button("Check Fraud"):
     pred=int((clf.predict_proba(Xin)[:,1]>=best_t)[0])
     label="Fraud" if pred else "Not Fraud"
     st.markdown(f"### Decision: **{label}**")
+
