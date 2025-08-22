@@ -3,13 +3,13 @@ import streamlit as st, pandas as pd, numpy as np, altair as alt
 from datetime import date
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-st.set_page_config("Fraud Dashboard (Fixed 0.30 + What-if)", layout="wide")
+st.set_page_config("Fraud Dashboard (Fixed threshold)", layout="wide")
 alt.renderers.set_embed_options(actions=False)
 RNG = 42
-PROD_THRESHOLD = 0.30  # business-fixed decision point
 
 # ───────────── Sidebar ─────────────
 with st.sidebar:
@@ -17,18 +17,14 @@ with st.sidebar:
     PROJ = st.text_input("Project", "mss-data-engineer-sandbox")
     DATASET = st.text_input("Dataset", "retail")
     RAW = st.text_input("Raw table", f"{PROJ}.{DATASET}.transaction_data")
-    S = st.date_input("Start", date(2023, 1, 1))
-    E = st.date_input("End",   date(2030, 12, 31))
-
-    with st.expander("What-if: try a different decision threshold (UI only)"):
-        TH = st.slider("What-if threshold", 0.01, 0.99, PROD_THRESHOLD, 0.01)
-        st.caption("Business decision stays **0.30**. Charts & metrics below reflect this slider for exploration.")
-    if "TH" not in locals(): TH = PROD_THRESHOLD  # fallback
-
-    st.caption("Production decisions use **0.30**; no calibration/optimizers shown.")
+    S = st.date_input("Start", date(2023,1,1))
+    E = st.date_input("End",  date(2030,12,31))
+    TH = st.slider("Decision threshold", 0.01, 0.99, 0.30, 0.01)
+    APPLY_SAFE = st.checkbox("Apply safe-case suppressor", True)
+    st.caption("Model uses a fixed decision threshold (default 0.30). No calibration applied.")
 
 # ───────────── BigQuery client ──────────
-sa = dict(st.secrets["gcp_service_account"]); sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+sa = dict(st.secrets["gcp_service_account"]); sa["private_key"]=sa["private_key"].replace("\\n","\n")
 creds = service_account.Credentials.from_service_account_info(sa)
 bq = bigquery.Client(credentials=creds, project=creds.project_id)
 
@@ -58,16 +54,17 @@ if df.empty:
 
 # ───────────── Cleaning ────────────
 df = df.sort_values("ts").drop_duplicates("order_id", keep="last")
-df = df[(df.q > 0) & (df.p > 0)].copy()
+df = df[(df.q>0) & (df.p>0)].copy()
 df["ts"]   = pd.to_datetime(df["ts"],   errors="coerce", utc=True).dt.tz_localize(None)
 df["acct"] = pd.to_datetime(df["acct"], errors="coerce", utc=True).dt.tz_localize(None)
-df["age"]  = (df["ts"] - df["acct"]).dt.days.astype(float).fillna(0).clip(lower=0)
+df["age"]  = (df["ts"] - df["acct"]).dt.days.astype("float").fillna(0).clip(lower=0)
 df["amt"]  = df.q * df.p
 
 def wins(g, col):
     lo, hi = g[col].quantile(.01), g[col].quantile(.99)
     g[col] = g[col].clip(lo, hi); return g
-for c in ["p","q"]: df = df.groupby("sku_category", group_keys=False).apply(wins, col=c)
+for c in ["p","q"]:
+    df = df.groupby("sku_category", group_keys=False).apply(wins, col=c)
 df["amt"] = df.q * df.p
 
 # ───────── Feature engineering ─────
@@ -82,7 +79,8 @@ def vel_last_hours(g, hours):
     t = pd.to_datetime(g["ts"]).astype("int64") // 1_000_000
     order = np.argsort(t); t = t.iloc[order].to_numpy(); w = int(hours*3600*1e6)
     left = np.searchsorted(t, t - w, side="left")
-    return pd.Series(np.arange(1,len(t)+1)-left, index=g.index[order]).reindex(g.index)
+    counts = np.arange(1, len(t)+1) - left
+    return pd.Series(counts, index=g.index[order]).reindex(g.index)
 
 df = df.sort_values("ts")
 df["cust_1h"]  = df.groupby("customer_id", group_keys=False).apply(vel_last_hours, 1)
@@ -96,7 +94,7 @@ df = df.groupby("customer_id", group_keys=False).apply(roll_stats)
 df["z"] = ((df["amt"] - df["c_m"]) / df["c_s"]).replace([np.inf, -np.inf], 0).fillna(0)
 p90 = float(np.nanpercentile(df["amt"], 90)) if len(df) else 0.0
 
-# strong fraud patterns (used as overrides to lift recall)
+# strong signals (used for recall boost)
 df["s_price_bulk"] = ((df["price_ratio"].sub(1).abs() >= .50) & (df["q"] >= 3)).astype(int)
 df["s_gc_geo"]     = ((df["gift_used"].fillna(False)) & (df["geo"]==1)).astype(int)
 df["s_burst"]      = ((df["cust_1h"]>=3) | (df["dev_1h"]>=3)).astype(int)
@@ -104,7 +102,7 @@ df["s_z"]          = (df["z"].abs() >= 2).astype(int)
 df["s_geo_hi"]     = ((df["geo"]==1) & (df["amt"] >= p90)).astype(int)
 df["s_any"]        = (df[["s_price_bulk","s_gc_geo","s_burst","s_z","s_geo_hi"]].sum(axis=1) > 0).astype(int)
 
-# ───────── Train (no calibration; class-weighted) ───────
+# ───────── Train (weighted for recall) ───────
 labeled = df[df.y.isin([0,1])].copy()
 if labeled["y"].nunique() < 2:
     st.error("Labeled data must contain both classes (0/1)."); st.stop()
@@ -120,8 +118,9 @@ X  = pd.concat([Xn, Xc], axis=1)
 y  = labeled["y"].astype(int).values
 cat_dummies = list(Xc.columns)
 
+# class imbalance weighting (helps recall at fixed 0.30)
 pos = max(1, int((y==1).sum())); neg = max(1, len(y)-pos)
-w_pos = min(10.0, neg/pos)  # weight frauds more; capped to avoid instability
+w_pos = min(10.0, neg/pos)  # cap to avoid overfitting
 
 @st.cache_resource(show_spinner=False)
 def fit_model(X, y, w_pos):
@@ -141,24 +140,31 @@ def score_all(D: pd.DataFrame) -> np.ndarray:
 
 df["score"] = score_all(df)
 
-# decisions at chosen threshold with rule-based refinements
+# decisions at fixed threshold with rule-based refinements
 alert_score = (df["score"] >= TH).astype(int)
-force_alert = (df["s_any"]==1)  # recall booster
+
+# 1) force-alert for strong patterns (improves recall)
+force_alert = (df["s_any"]==1)
+
+# 2) safe-case suppressor (optional; improves precision/accuracy)
 safe = ((df["amt"]<=100)&(df["q"]<=2)&(df["ship"]==df["ip"])&
         (df["gift_pct"]<.05)&(df["price_ratio"].sub(1).abs()<=.15)&
         (df["s_price_bulk"]==0)&(df["s_gc_geo"]==0)&(df["s_burst"]==0)&
-        (df["s_z"]==0)&(df["s_geo_hi"]==0))           # precision booster
+        (df["s_z"]==0)&(df["s_geo_hi"]==0))
 
-df["alert"] = np.where(force_alert, 1, np.where(safe & (alert_score==1), 0, alert_score))
+if APPLY_SAFE:
+    df["alert"] = np.where(force_alert, 1, np.where(safe & (alert_score==1), 0, alert_score))
+else:
+    df["alert"] = np.where(force_alert, 1, alert_score)
 
 # ───────── KPIs ─────────
-st.subheader(f"**Key Metrics (Threshold = {TH:.2f} | Prod = {PROD_THRESHOLD:.2f})**")
+st.subheader(f"**Key Metrics (Threshold = {TH:.2f})**")
 TOT, AL = len(df), int(df["alert"].sum())
 c1,c2,c3 = st.columns(3)
 c1.metric("**Total transactions**", TOT)
 c2.metric(f"**Fraud alerts (≥{TH:.2f})**", AL)
 c3.metric("**Alert rate**", f"{AL/max(1,TOT):.2%}")
-st.caption("Model uses class weighting + strong-pattern overrides (recall) and safe-case suppression (precision).")
+st.caption("Training uses imbalance weighting and rule refinements (force-alert on strong fraud patterns; optional safe-case suppressor).")
 
 # Trend
 st.subheader("**Daily Trend**")
@@ -176,15 +182,15 @@ st.altair_chart(
     use_container_width=True
 )
 
-# Top alerts — ALL rows
+# Top alerts — show ALL
 st.subheader(f"**Top Alerts (score ≥ {TH:.2f})**")
 cols = [c for c in ["order_id","ts","customer_id","store_id","sku_id","sku_category","amt","q","pay","ship","ip","score"] if c in df]
 top = df[df["alert"]==1].sort_values(["score","ts"], ascending=[False,False]).drop_duplicates("order_id")
 st.caption(f"Showing **all {len(top)}** alerts.")
 st.dataframe(top.loc[:, cols], use_container_width=True, height=min(700, 35*max(5,len(top))))
 
-# Evaluation at bottom
-st.subheader(f"**Model Evaluation (threshold = {TH:.2f})**")
+# ───────── Evaluation at bottom ────────
+st.subheader(f"**Model Evaluation (fixed threshold = {TH:.2f})**")
 st.caption("Precision = among alerts, % truly fraud; Recall = of all fraud, % caught; F1 = balance; Accuracy = overall correctness.")
 y_true = labeled["y"].astype(int).values
 y_pred = df.loc[labeled.index, "alert"].astype(int).values
