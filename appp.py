@@ -1,4 +1,4 @@
-# app.py — end-to-end: raw → clean/EDA → model → evaluate → predict
+# app.py — end-to-end: raw → clean/EDA → model → predict (no threshold text in UI)
 import streamlit as st, pandas as pd, numpy as np, altair as alt
 from datetime import date, datetime
 from google.cloud import bigquery
@@ -6,7 +6,6 @@ from google.oauth2 import service_account
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
                              roc_auc_score, average_precision_score, confusion_matrix)
-from sklearn.model_selection import train_test_split
 
 st.set_page_config("Fraud: Data → EDA → Model → Predict", layout="wide")
 alt.renderers.set_embed_options(actions=False)
@@ -20,12 +19,11 @@ with st.sidebar:
     RAW = st.text_input("Raw table", f"{PROJ}.{DATASET}.transaction_data")
     S = st.date_input("Start date", date(2023,1,1))
     E = st.date_input("End date",   date(2030,12,31))
-    st.caption("Pulls raw rows between Start/End from the specified table. No threshold controls shown anywhere.")
 
 # ───────────────────────── BigQuery client & loader ───────────────────────
 @st.cache_data(show_spinner=True)
-def load_raw(raw, s, e, secrets_dict):
-    sa = dict(secrets_dict)
+def load_raw(raw, s, e, _secrets):  # underscore arg => don't hash for caching
+    sa = dict(_secrets)
     sa["private_key"] = sa["private_key"].replace("\\n","\n")
     creds = service_account.Credentials.from_service_account_info(sa)
     bq = bigquery.Client(credentials=creds, project=creds.project_id)
@@ -65,14 +63,13 @@ tab1, tab2, tab3, tab4 = st.tabs(["1) Raw Data", "2) Cleaning & EDA", "3) Model 
 
 # ───────────────────────── 1) RAW ─────────────────────────
 with tab1:
-    st.subheader("Raw data (from BigQuery)")
+    st.subheader("Raw data")
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Rows", len(df_raw))
     c2.metric("Columns", len(df_raw.columns))
-    c3.metric("Min ts", str(pd.to_datetime(df_raw["ts"]).min()))
-    c4.metric("Max ts", str(pd.to_datetime(df_raw["ts"]).max()))
+    c3.metric("Earliest ts", str(pd.to_datetime(df_raw["ts"]).min()))
+    c4.metric("Latest ts", str(pd.to_datetime(df_raw["ts"]).max()))
     st.dataframe(df_raw.sample(min(500,len(df_raw))), use_container_width=True, height=420)
-    st.caption("Random sample of raw rows; use the Cleaning & EDA tab for issues like skewness and outliers.")
 
 # ───────────────────────── 2) CLEANING & EDA ─────────────────────────
 def _wins(g, col):
@@ -117,7 +114,7 @@ def clean_and_fe(raw_df: pd.DataFrame) -> pd.DataFrame:
     df["hour"] = pd.to_datetime(df["ts"]).dt.hour
     df["dow"]  = pd.to_datetime(df["ts"]).dt.dayofweek
 
-    # payment risk (very simple)
+    # payment risk (simple)
     pay_map = {"crypto":3,"paypal":2,"credit_card":2,"apple_pay":2,"google_pay":2,"debit_card":1,"bank_transfer":0,"cod":0}
     df["pay_risk"] = df["payment_method"].map(pay_map).fillna(1).astype(int)
 
@@ -137,7 +134,7 @@ with tab2:
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Rows after cleaning", len(df))
     c2.metric("Distinct customers", df["customer_id"].nunique())
-    c3.metric("Fraud labels present", df["fraud_flag"].notna().sum())
+    c3.metric("Rows with label", df["fraud_flag"].notna().sum())
     c4.metric("Fraud prevalence", f"{(df['fraud_flag'].fillna(0).mean()*100):.2f}%")
 
     st.markdown("**Skewness (selected numeric columns)**")
@@ -215,7 +212,7 @@ def train_model(clean_df: pd.DataFrame):
     # predict proba on test
     pr_te = clf.predict_proba(X_te)[:,1]
 
-    # choose operating threshold (maximize F1 on the test set)
+    # choose operating point (maximize F1 on the test set)
     ts = np.linspace(0.01, 0.99, 99)
     f1s = []
     for t in ts:
@@ -224,10 +221,9 @@ def train_model(clean_df: pd.DataFrame):
     best_idx = int(np.argmax(f1s))
     th = float(ts[best_idx])
 
-    # evaluate at chosen threshold
+    # evaluate at chosen operating point
     y_pred = (pr_te >= th).astype(int)
     metrics = {
-        "threshold": th,
         "accuracy": accuracy_score(y_te, y_pred),
         "precision": precision_score(y_te, y_pred, zero_division=0),
         "recall": recall_score(y_te, y_pred, zero_division=0),
@@ -242,7 +238,7 @@ def train_model(clean_df: pd.DataFrame):
         "all_cols": all_cols,
         "num_cols": num_cols,
         "cat_cols": cat_cols,
-        "threshold": th
+        "threshold": th  # internal use only
     }
     evalpack = {
         "metrics": metrics,
@@ -252,7 +248,7 @@ def train_model(clean_df: pd.DataFrame):
     return artifacts, evalpack
 
 with tab3:
-    st.subheader("Train model & evaluate (automatic threshold selection)")
+    st.subheader("Model & metrics")
     try:
         artifacts, evalpack = train_model(df)
     except Exception as ex:
@@ -267,44 +263,41 @@ with tab3:
     c4.metric("F1-score",  f"{m['f1']*100:.2f}%")
     c5.metric("ROC-AUC",   f"{m['roc_auc']:.3f}")
     c6.metric("PR-AUC",    f"{m['pr_auc']:.3f}")
-    st.caption(f"Chosen operating point (max F1 on test): **threshold = {m['threshold']:.2f}** (not user-controlled).")
 
-    # Confusion matrix heatmap
+    # Confusion matrix
     cm = evalpack["cm"]
     cm_df = pd.DataFrame(cm, index=["Actual 0","Actual 1"], columns=["Pred 0","Pred 1"]).reset_index().melt(
         id_vars="index", var_name="Predicted", value_name="Count").rename(columns={"index":"Actual"})
     st.altair_chart(
-        alt.Chart(cm_df).mark_rect().encode(x="Predicted:N", y="Actual:N", color=alt.Color("Count:Q", scale=alt.Scale(scheme="blues")),
+        alt.Chart(cm_df).mark_rect().encode(x="Predicted:N", y="Actual:N",
+                                            color=alt.Color("Count:Q", scale=alt.Scale(scheme="blues")),
                                             tooltip=["Actual","Predicted","Count"]).properties(height=180),
         use_container_width=True
     )
 
-    # Curves
+    # ROC curve (simple sweep)
     te = evalpack["test_df"]
-    # ROC
-    # Build points for ROC manually (threshold sweep)
-    def roc_points(y_true, scores, n=50):
-        thr = np.linspace(0,1,n)
-        out=[]
+    def roc_points(y_true, scores, n=80):
+        thr = np.linspace(0,1,n); out=[]
         P=(y_true==1).sum(); N=(y_true==0).sum()
         for t in thr:
-            yhat = (scores>=t).astype(int)
-            tp = int(((y_true==1)&(yhat==1)).sum()); fp=int(((y_true==0)&(yhat==1)).sum())
-            tn = int(((y_true==0)&(yhat==0)).sum()); fn=int(((y_true==1)&(yhat==0)).sum())
+            yhat=(scores>=t).astype(int)
+            tp=int(((y_true==1)&(yhat==1)).sum()); fp=int(((y_true==0)&(yhat==1)).sum())
+            tn=int(((y_true==0)&(yhat==0)).sum()); fn=int(((y_true==1)&(yhat==0)).sum())
             tpr = 0 if P==0 else tp/P
             fpr = 0 if N==0 else fp/N
             out.append({"fpr":fpr,"tpr":tpr})
         return pd.DataFrame(out)
     roc_df = roc_points(te["fraud_flag"].values, te["prob"].values, 80)
     st.altair_chart(
-        alt.Chart(roc_df).mark_line().encode(x=alt.X("fpr:Q", title="FPR"), y=alt.Y("tpr:Q", title="TPR")).properties(height=200, title=f"ROC (AUC={m['roc_auc']:.3f})"),
+        alt.Chart(roc_df).mark_line().encode(x=alt.X("fpr:Q", title="FPR"), y=alt.Y("tpr:Q", title="TPR"))
+        .properties(height=200, title=f"ROC (AUC={m['roc_auc']:.3f})"),
         use_container_width=True
     )
 
-    # PR curve
+    # PR curve (sweep)
     def pr_points(y_true, scores, n=80):
-        thr = np.linspace(0,1,n)
-        out=[]
+        thr=np.linspace(0,1,n); out=[]
         for t in thr:
             yhat=(scores>=t).astype(int)
             tp=int(((y_true==1)&(yhat==1)).sum()); fp=int(((y_true==0)&(yhat==1)).sum())
@@ -315,16 +308,17 @@ with tab3:
         return pd.DataFrame(out)
     pr_df = pr_points(te["fraud_flag"].values, te["prob"].values, 80)
     st.altair_chart(
-        alt.Chart(pr_df).mark_line().encode(x=alt.X("recall:Q", title="Recall"), y=alt.Y("precision:Q", title="Precision")).properties(height=200, title=f"PR (AP≈{m['pr_auc']:.3f})"),
+        alt.Chart(pr_df).mark_line().encode(x=alt.X("recall:Q", title="Recall"),
+                                            y=alt.Y("precision:Q", title="Precision"))
+        .properties(height=200, title=f"PR (AP≈{m['pr_auc']:.3f})"),
         use_container_width=True
     )
 
-    st.markdown("**Hold-out predictions (test set)**")
+    st.markdown("**Hold-out predictions (test slice)**")
     st.dataframe(te.sort_values("prob", ascending=False).head(200), use_container_width=True, height=260)
 
 # ───────────────────────── 4) PREDICT ─────────────────────────
 def prepare_X_for_model(df_like: pd.DataFrame, artifacts):
-    """Takes a 1+ row DataFrame with same raw columns/derived features; returns X aligned to training columns."""
     cat_cols = artifacts["cat_cols"]; num_cols = artifacts["num_cols"]; all_cols = artifacts["all_cols"]
     Xn = df_like[num_cols].fillna(0)
     Xc = pd.get_dummies(df_like[cat_cols].astype(str), dummy_na=False)
@@ -332,9 +326,7 @@ def prepare_X_for_model(df_like: pd.DataFrame, artifacts):
     return X
 
 def make_features_from_inputs(d):
-    """Build a single-row DF with engineered features from manual inputs."""
     row = {}
-    # Raw-ish fields
     row["order_id"] = d.get("order_id","new_order")
     row["ts"] = pd.to_datetime(d.get("ts"))
     row["account_created_at"] = pd.to_datetime(d.get("account_created_at"))
@@ -352,13 +344,10 @@ def make_features_from_inputs(d):
     row["gift_card_amount"] = float(d.get("gift_card_amount",0.0))
     row["gift_card_used"] = bool(d.get("gift_card_used",False))
 
-    # Derived
     row["account_age_days"] = max(0.0, (row["ts"] - row["account_created_at"]).days)
     row["order_amount"] = row["quantity"]*row["unit_price"]
 
-    # Use global medians from training set for category avg price if needed
-    # Here, simple ratio proxy:
-    row["price_ratio"] = 1.0  # conservative (unknown cat context)
+    row["price_ratio"] = 1.0  # conservative default
     den = row["order_amount"] if row["order_amount"]!=0 else np.nan
     row["coupon_pct"] = (row["coupon_discount"]/den) if den==den else 0.0
     row["gift_pct"]   = (row["gift_card_amount"]/den) if den==den else 0.0
@@ -368,35 +357,30 @@ def make_features_from_inputs(d):
     pay_map = {"crypto":3,"paypal":2,"credit_card":2,"apple_pay":2,"google_pay":2,"debit_card":1,"bank_transfer":0,"cod":0}
     row["pay_risk"] = int(pay_map.get(row["payment_method"], 1))
 
-    # Risk shapes (use local p90 approximation  = 0 for single, so gate uses other signals)
     row["s_price_bulk"] = int(abs(row["price_ratio"]-1.0)>=0.50 and row["quantity"]>=3)
     row["s_gc_geo"]     = int(row["gift_card_used"] and row["geo_mismatch"]==1)
-    row["s_geo_hi"]     = int(row["geo_mismatch"]==1 and row["order_amount"]>=2000)  # conservative high amount
+    row["s_geo_hi"]     = int(row["geo_mismatch"]==1 and row["order_amount"]>=2000)
     row["s_any"]        = int(row["s_price_bulk"] or row["s_gc_geo"] or row["s_geo_hi"])
-
-    # Wrap to DataFrame
     return pd.DataFrame([row])
 
 with tab4:
     st.subheader("Predict")
-    st.caption("Pick an existing cleaned row or enter a brand-new order. The model uses the threshold it learned on the test set (max F1).")
-
     artifacts = st.session_state.get("artifacts_cache") or artifacts
     st.session_state["artifacts_cache"] = artifacts
-    clf = artifacts["clf"]; threshold = artifacts["threshold"]
+    clf = artifacts["clf"]; thr = artifacts["threshold"]  # internal only
 
     colA, colB = st.columns(2, gap="large")
 
-    # A) Pick an existing order (from cleaned)
+    # A) Pick an existing cleaned row
     with colA:
-        st.markdown("**Use a row from the cleaned data**")
+        st.markdown("**Score an existing order**")
         pick = st.selectbox("Order to score", options=df["order_id"].astype(str).head(5000).tolist())
         row_df = df[df["order_id"].astype(str)==pick].head(1)
         Xp = prepare_X_for_model(row_df, artifacts)
         p = float(clf.predict_proba(Xp)[:,1][0])
-        yhat = int(p >= threshold)
-        st.metric("Predicted probability of fraud", f"{p:.3f}")
-        st.markdown(f"**Decision at learned threshold {threshold:.2f}**: {'🚨 FRAUD' if yhat==1 else '✅ Not fraud'}")
+        yhat = int(p >= thr)
+        st.metric("Predicted probability", f"{p:.3f}")
+        st.markdown(f"**Decision**: {'🚨 FRAUD' if yhat==1 else '✅ Not fraud'}")
         st.dataframe(row_df, use_container_width=True, height=200)
 
     # B) Manual form
@@ -430,9 +414,9 @@ with tab4:
                 })
                 Xn = prepare_X_for_model(rec, artifacts)
                 p2 = float(clf.predict_proba(Xn)[:,1][0])
-                y2 = int(p2 >= threshold)
-                st.metric("Predicted probability of fraud", f"{p2:.3f}")
-                st.markdown(f"**Decision at learned threshold {threshold:.2f}**: {'🚨 FRAUD' if y2==1 else '✅ Not fraud'}")
+                y2 = int(p2 >= thr)
+                st.metric("Predicted probability", f"{p2:.3f}")
+                st.markdown(f"**Decision**: {'🚨 FRAUD' if y2==1 else '✅ Not fraud'}")
                 st.dataframe(rec, use_container_width=True, height=220)
             except Exception as ex:
                 st.error(f"Could not score: {ex}")
