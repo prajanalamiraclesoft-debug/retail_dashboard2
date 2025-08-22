@@ -35,7 +35,7 @@ if df.empty: st.warning("No rows in this range."); st.stop()
 
 # -------- cleaning
 df=df.sort_values("ts").drop_duplicates("order_id",keep="last"); df=df[(df.q>0)&(df.p>0)].copy()
-df["amt"]=df.q*df.p; df["age"]=(pd.to_datetime(df["ts"]).dt.date-pd.to_datetime(df["acct"]).dt.date).dt.days.fillna(0)
+df["amt"]=df.q*df.p;df["age"] = (df["ts"] - df["acct"]).dt.days.astype("float").fillna(0).clip(lower=0)
 for c in ["p","q"]:
     df[c]=df.groupby("sku_category")[c].transform(lambda s:s.clip(s.quantile(.01),s.quantile(.99)))
 df["amt"]=df.q*df.p
@@ -111,3 +111,4 @@ st.subheader("**Top Alerts (score ≥ 0.30)**")
 cols=[c for c in ["order_id","ts","customer_id","store_id","sku_id","sku_category","amt","q","pay","ship","ip","score"] if c in df]
 al=df[df.alert==1].sort_values(["score","ts"],ascending=[False,False]).drop_duplicates("order_id")
 st.dataframe(al.loc[:,cols].head(50),use_container_width=True,height=320)
+
