@@ -81,7 +81,7 @@ THRESH = 0.30
 yhat = (probs >= THRESH).astype(int)
 
 # -------- Dashboard --------
-st.title("Retail Fraud Detection – Business View")
+st.title("Retail Fraud Detection")
 
 # 4,000 rows (scrollable)
 st.subheader("Raw 4,000 Transactions")
@@ -135,3 +135,4 @@ Xin=pd.concat([Xnum,Xcat],axis=1).reindex(columns=cols_model,fill_value=0)
 if st.button("Check Fraud"):
     pred = int((clf.predict_proba(Xin)[:,1] >= THRESH)[0])
     st.markdown(f"### Decision: **{'Fraud' if pred else 'Not Fraud'}**")
+
