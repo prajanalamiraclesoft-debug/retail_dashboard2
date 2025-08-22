@@ -20,7 +20,7 @@ alt.renderers.set_embed_options(actions=False)
 
 # ─────────────────────────── Sidebar (read-only) ─────────────────────
 with st.sidebar:
-    st.header("Data source (read-only)")
+    st.header("Data source")
     PROJ = st.text_input("Project", "mss-data-engineer-sandbox")
     DATASET = st.text_input("Dataset", "retail")
     RAW_TABLE = st.text_input("Raw table", f"{PROJ}.{DATASET}.transaction_data")
@@ -335,3 +335,4 @@ if st.button("Check"):
     st.caption("Note: The system balances quality and coverage under the hood; no manual threshold tuning is needed in the UI.")
 
 # ─────────────────────────── End ─────────────────────────────────────
+
