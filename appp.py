@@ -31,7 +31,7 @@ with st.sidebar:
     st.header("BigQuery")
     PROJ = st.text_input("Project", "mss-data-engineer-sandbox")
     DATASET = st.text_input("Dataset", "retail")
-    TABLE = st.text_input("Raw table", f"{PROJ}.{DATASET}.transaction_data")
+    TABLE = st.text_input("Raw table", f"{PROJ}.{DATASET}.transactions_cleaned")
     S = st.date_input("Start date", date(2023,1,1))
     E = st.date_input("End date",   date(2030,12,31))
     st.caption("Pulls raw rows between Start/End from the specified table.")
@@ -360,3 +360,4 @@ if submitted:
         "Price ratio vs category": round(price_ratio,2),
         "Account age (days)": int(acct_age)
     }]))
+
