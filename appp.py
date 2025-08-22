@@ -295,4 +295,3 @@ st.altair_chart(
 )
 
 st.caption("This dashboard is schema-aware and uses the threshold slider for decisions and evaluation.")
-
