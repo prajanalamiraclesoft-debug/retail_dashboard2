@@ -1,4 +1,3 @@
-# app.py — Walmart-style Retail Fraud Dashboard (BigQuery 4k snapshot, no COD/bank)
 # Run: streamlit run app.py
 
 import streamlit as st, pandas as pd, numpy as np, altair as alt
@@ -6,6 +5,8 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import time
+from google.api_core.exceptions import GoogleAPICallError, NotFound, Forbidden, DeadlineExceeded
 
 # ---------------- UI / Theme ----------------
 st.set_page_config(page_title="Retail Fraud – Executive Dashboard", layout="wide")
@@ -33,42 +34,57 @@ sa = dict(st.secrets["gcp_service_account"]); sa["private_key"] = sa["private_ke
 creds = service_account.Credentials.from_service_account_info(sa)
 bq = bigquery.Client(credentials=creds, project=creds.project_id)
 
-# ---------------- Load pinned 4k snapshot (in-query) ----------------
-@st.cache_data(show_spinner=True)
-def load_snapshot(_secrets_guard):
-    sql = """
-    WITH base AS (
-      SELECT
-        order_id,
-        TIMESTAMP(timestamp)                    AS ts,
-        CAST(customer_id AS STRING)             AS customer_id,
-        CAST(device_id   AS STRING)             AS device_id,
-        CAST(store_id    AS STRING)             AS store_id,
-        CAST(sku_id      AS STRING)             AS sku_id,
-        CAST(sku_category AS STRING)            AS sku_category,
-        SAFE_CAST(quantity      AS FLOAT64)     AS quantity,
-        SAFE_CAST(unit_price    AS FLOAT64)     AS unit_price,
-        CAST(payment_method AS STRING)          AS payment_method,
-        CAST(shipping_country AS STRING)        AS ship_country,
-        CAST(ip_country      AS STRING)         AS ip_country,
-        SAFE_CAST(coupon_discount  AS FLOAT64)  AS coupon_discount,
-        SAFE_CAST(gift_card_amount AS FLOAT64)  AS gift_balance_used,
-        SAFE_CAST(gift_card_used   AS BOOL)     AS gift_used_flag,
-        SAFE_CAST(account_created_at AS TIMESTAMP) AS account_created_at,
-        SAFE_CAST(fraud_flag AS INT64)          AS fraud_flag
-      FROM `mss-data-engineer-sandbox.retail.transaction_data`
-      -- Pinned window that produced better results previously
-      WHERE DATE(timestamp) BETWEEN '2023-01-01' AND '2030-12-31'
-    )
-    SELECT *
-    FROM base
-    QUALIFY ROW_NUMBER() OVER (ORDER BY ts, order_id) <= 4000
-    """
-    return bq.query(sql).result().to_dataframe()
 
-raw = load_snapshot(st.secrets)
-if raw.empty:
-    st.warning("No rows returned by the pinned snapshot."); st.stop()
+# ---------------- Load pinned 4k snapshot (robust) ----------------
+@st.cache_data(show_spinner=True)
+def load_snapshot(_secrets_guard) -> pd.DataFrame:
+    # Keep the snapshot the business liked, but make the SQL simpler & faster
+    sql = """
+    SELECT
+      order_id,
+      TIMESTAMP(timestamp)                    AS ts,
+      CAST(customer_id AS STRING)             AS customer_id,
+      CAST(device_id   AS STRING)             AS device_id,
+      CAST(store_id    AS STRING)             AS store_id,
+      CAST(sku_id      AS STRING)             AS sku_id,
+      CAST(sku_category AS STRING)            AS sku_category,
+      SAFE_CAST(quantity      AS FLOAT64)     AS quantity,
+      SAFE_CAST(unit_price    AS FLOAT64)     AS unit_price,
+      CAST(payment_method AS STRING)          AS payment_method,
+      CAST(shipping_country AS STRING)        AS ship_country,
+      CAST(ip_country      AS STRING)         AS ip_country,
+      SAFE_CAST(coupon_discount  AS FLOAT64)  AS coupon_discount,
+      SAFE_CAST(gift_card_amount AS FLOAT64)  AS gift_balance_used,
+      SAFE_CAST(gift_card_used   AS BOOL)     AS gift_used_flag,
+      SAFE_CAST(account_created_at AS TIMESTAMP) AS account_created_at,
+      SAFE_CAST(fraud_flag AS INT64)          AS fraud_flag
+    FROM `mss-data-engineer-sandbox.retail.transaction_data`
+    WHERE DATE(timestamp) BETWEEN '2023-01-01' AND '2030-12-31'
+    ORDER BY timestamp, order_id
+    LIMIT 4000
+    """
+
+    # Retry up to 3 times with exponential backoff; hard 3-minute per attempt timeout
+    last_err = None
+    for attempt in range(3):
+        try:
+            job = bq.query(
+                sql,
+                job_config=bigquery.QueryJobConfig(use_legacy_sql=False)
+            )
+            return job.result(timeout=180).to_dataframe()  # 3 minutes per attempt
+        except (DeadlineExceeded, GoogleAPICallError, Forbidden, NotFound, Exception) as e:
+            last_err = e
+            # brief backoff, then try again
+            time.sleep(2 ** attempt)
+    # If we get here, every attempt failed—surface the error in the UI so you know why
+    st.error(
+        "BigQuery snapshot failed after 3 attempts. "
+        "Most common causes: temporary service issue, missing permissions, or table name mismatch.\n\n"
+        f"Root cause: {type(last_err).__name__}: {last_err}"
+    )
+    st.stop()
+
 
 # ---------------- Strong, business-friendly features ----------------
 df = raw.copy().dropna(subset=["order_id"]).drop_duplicates("order_id", keep="last")
@@ -332,4 +348,5 @@ if submitted:
         "Price ratio vs category": round(price_ratio,2),
         "Account age (days)": int(acct_age)
     }]))
+
 
