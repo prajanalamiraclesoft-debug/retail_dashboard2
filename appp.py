@@ -17,10 +17,12 @@ with st.sidebar:
     PROJ = st.text_input("Project", "mss-data-engineer-sandbox")
     DATASET = st.text_input("Dataset", "retail")
     RAW = st.text_input("Raw table", f"{PROJ}.{DATASET}.transaction_data")
-    S = st.date_input("Start", date(2023,1,1))
+    S = st.date_input("Start", date(2023,2,1))
     E = st.date_input("End",  date(2030,12,31))
     TH = st.slider("Decision threshold", 0.01, 0.99, 0.30, 0.01)
     OPT = st.selectbox("Optimize threshold for", ["Balanced accuracy", "F1", "Accuracy"], index=0)
+    MIN_PREC = st.slider("Calibration: minimum precision guard", 0.00, 0.90, 0.25, 0.05)
+    APPLY_SAFE = st.checkbox("Apply safe-case suppressor", True)
     st.caption("Scores are **calibrated** so your chosen threshold (default 0.30) matches the validated operating point.")
 
 # ───────────────── BigQuery client ─────────────────
@@ -58,13 +60,11 @@ df["ts"]   = pd.to_datetime(df["ts"],   errors="coerce", utc=True).dt.tz_localiz
 df["acct"] = pd.to_datetime(df["acct"], errors="coerce", utc=True).dt.tz_localize(None)
 df["age"]  = (df["ts"] - df["acct"]).dt.days.astype("float").fillna(0).clip(lower=0)
 df["amt"]  = df.q*df.p
-
-def wins(g,col):
-    lo,hi=g[col].quantile(.01),g[col].quantile(.99); g[col]=g[col].clip(lo,hi); return g
+def wins(g,col): lo,hi=g[col].quantile(.01),g[col].quantile(.99); g[col]=g[col].clip(lo,hi); return g
 for c in ["p","q"]: df = df.groupby("sku_category", group_keys=False).apply(wins, col=c)
 df["amt"]=df.q*df.p
 
-# ───────────────── Feature engineering ─────────────────
+# ───────────────── Features ─────────────────
 cat_avg = df.groupby("sku_category")["p"].transform("mean").replace(0,np.nan)
 df["price_ratio"] = (df["p"]/cat_avg).fillna(1.0)
 den=df["amt"].replace(0,np.nan); df["coup_pct"]=(df["coup"]/den).fillna(0); df["gift_pct"]=(df["gift_amt"]/den).fillna(0)
@@ -82,11 +82,11 @@ df["cust_24h"]=df.groupby("customer_id",group_keys=False).apply(vel_last_hours,2
 df["dev_1h"]=df.groupby("dev",group_keys=False).apply(vel_last_hours,1)
 
 def roll_stats(g):
-    g=g.sort_values("ts"); r=g["amt"].rolling(10,min_periods=1); g["c_m"]=r.mean(); g["c_s"]=r.std(ddof=0).replace(0,np.nan); return g
+    g=g.sort_values("ts"); r=g["amt"].rolling(10,min_periods=1)
+    g["c_m"]=r.mean(); g["c_s"]=r.std(ddof=0).replace(0,np.nan); return g
 df=df.groupby("customer_id",group_keys=False).apply(roll_stats)
-df["z"]=((df["amt"]-df["c_m"]) / df["c_s"]).replace([np.inf,-np.inf],0).fillna(0)
+df["z"]=((df["amt"]-df["c_m"])/df["c_s"]).replace([np.inf,-np.inf],0).fillna(0)
 p90=float(np.nanpercentile(df["amt"],90)) if len(df) else 0.0
-
 df["s_price_bulk"]=((df["price_ratio"].sub(1).abs()>=.5)&(df["q"]>=3)).astype(int)
 df["s_gc_geo"]=((df["gift_used"].fillna(False))&(df["geo"]==1)).astype(int)
 df["s_burst"]=((df["cust_1h"]>=3)|(df["dev_1h"]>=3)).astype(int)
@@ -94,7 +94,7 @@ df["s_z"]=(df["z"].abs()>=2).astype(int)
 df["s_geo_hi"]=((df["geo"]==1)&(df["amt"]>=p90)).astype(int)
 df["s_any"]=(df[["s_price_bulk","s_gc_geo","s_burst","s_z","s_geo_hi"]].sum(axis=1)>0).astype(int)
 
-# ───────────────── Train + global calibration ─────────────────
+# ───────────────── Train + calibration ─────────────────
 labeled=df[df.y.isin([0,1])].copy()
 if labeled["y"].nunique()<2: st.error("Labeled data must contain both classes (0/1)."); st.stop()
 
@@ -110,36 +110,45 @@ cat_dummies=list(Xc.columns)
 
 @st.cache_data(show_spinner=False)
 def cv_calibrate_threshold(X, y, TH, opt="Balanced accuracy", n_splits=3, max_iter=200, min_precision=0.25):
+    # class weighting to favor recall on positives
+    pos = int((y == 1).sum()); neg = len(y) - pos
+    w_pos = (neg / max(1, pos))  # >1 when positives are rare
     skf=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
     probs=np.zeros(len(y))
     for tr,va in skf.split(X,y):
         clf=HistGradientBoostingClassifier(max_iter=max_iter, learning_rate=.1,
                                            early_stopping=True, random_state=RANDOM_STATE)
-        clf.fit(X.iloc[tr],y[tr]); probs[va]=clf.predict_proba(X.iloc[va])[:,1]
+        sw=np.where(y[tr]==1, w_pos, 1.0)  # weight positives
+        clf.fit(X.iloc[tr], y[tr], sample_weight=sw)
+        probs[va]=clf.predict_proba(X.iloc[va])[:,1]
+
     ts=np.linspace(.01,.99,99); best_t, best_score=0.50,-1.0
-    pos=(y==1).sum(); neg=(y==0).sum()
+    pos_tot = (y==1).sum(); neg_tot=(y==0).sum()
     for t in ts:
         yhat=(probs>=t).astype(int)
         tp=int(((y==1)&(yhat==1)).sum()); tn=int(((y==0)&(yhat==0)).sum())
         fp=int(((y==0)&(yhat==1)).sum()); fn=int(((y==1)&(yhat==0)).sum())
-        prec=0 if (tp+fp)==0 else tp/(tp+fp); rec=0 if pos==0 else tp/pos
-        acc=(tp+tn)/max(1,len(y)); tnr=0 if neg==0 else tn/neg; bal=0.5*(rec+tnr)
-        f1=0 if prec+rec==0 else 2*prec*rec/(prec+rec)
-        if prec < min_precision:  # avoid the "flag everything" regime
+        prec=0 if (tp+fp)==0 else tp/(tp+fp); rec=0 if pos_tot==0 else tp/pos_tot
+        acc=(tp+tn)/max(1,len(y)); tnr=0 if neg_tot==0 else tn/neg_tot; bal=0.5*(rec+tnr)
+        f1=0 if (prec+rec)==0 else 2*prec*rec/(prec+rec)
+        if prec < min_precision:  # keep precision reasonable
             continue
         score={"Balanced accuracy":bal, "F1":f1, "Accuracy":acc}[opt]
         if score>best_score: best_score, best_t=score, t
-    if best_score<0: best_t=0.50  # fallback
-    return best_t, (TH/best_t if best_t>0 else 1.0)
+    if best_score<0: best_t=0.50
+    return best_t, (TH/best_t if best_t>0 else 1.0), w_pos
 
-t_star, scale = cv_calibrate_threshold(X, y, TH, OPT)
+t_star, scale, w_pos = cv_calibrate_threshold(X, y, TH, OPT, min_precision=MIN_PREC)
 
 @st.cache_resource(show_spinner=False)
-def fit_final_model(X,y,max_iter=200):
-    m=HistGradientBoostingClassifier(max_iter=max_iter,learning_rate=.1,
-                                     early_stopping=True,random_state=RANDOM_STATE)
-    m.fit(X,y); return m
-final_clf=fit_final_model(X,y)
+def fit_final_model(X, y, w_pos, max_iter=200):
+    m=HistGradientBoostingClassifier(max_iter=max_iter, learning_rate=.1,
+                                     early_stopping=True, random_state=RANDOM_STATE)
+    sw=np.where(y==1, w_pos, 1.0)
+    m.fit(X, y, sample_weight=sw)
+    return m
+
+final_clf=fit_final_model(X, y, w_pos)
 
 def score_all(D):
     Xn_=D[num_cols].fillna(0)
@@ -149,23 +158,22 @@ def score_all(D):
 
 df["score"]=score_all(df)
 
-# safe-case suppressor → boosts precision/accuracy
+# safe-case suppressor (toggle)
 safe=((df["amt"]<=100)&(df["q"]<=2)&(df["ship"]==df["ip"])&
       (df["gift_pct"]<.05)&(df["price_ratio"].sub(1).abs()<=.15)&
       (df["s_price_bulk"]==0)&(df["s_gc_geo"]==0)&(df["s_burst"]==0)&
       (df["s_z"]==0)&(df["s_geo_hi"]==0))
-
-df["alert_raw"]=(df["score"]>=TH).astype(int)
-df["alert"]=((df["score"]>=TH)&(~safe)).astype(int)
+if APPLY_SAFE:
+    df["alert"]=((df["score"]>=TH)&(~safe)).astype(int)
+else:
+    df["alert"]=(df["score"]>=TH).astype(int)
 
 # ───────────────── KPIs ─────────────────
 st.subheader(f"**Key Metrics (Threshold = {TH:.2f})**")
-TOT, AL = len(df), int(df["alert"].sum())
-c1,c2,c3 = st.columns(3)
-c1.metric("**Total transactions**", TOT)
-c2.metric(f"**Fraud alerts (≥{TH:.2f})**", AL)
-c3.metric("**Alert rate**", f"{AL/max(1,TOT):.2%}")
-st.caption(f"Calibration (**{OPT}**): best threshold t*≈{t_star:.2f} → scores scaled so decisions occur at {TH:.2f}.")
+TOT, AL=len(df), int(df["alert"].sum())
+c1,c2,c3=st.columns(3)
+c1.metric("**Total transactions**",TOT); c2.metric(f"**Fraud alerts (≥{TH:.2f})**",AL); c3.metric("**Alert rate**",f"{AL/max(1,TOT):.2%}")
+st.caption(f"Calibration (**{OPT}**, min precision ≥ {MIN_PREC:.2f}): best t*≈{t_star:.2f} → scores scaled so decisions occur at {TH:.2f}.")
 
 # ───────────────── Trend & distribution ─────────────────
 st.subheader("**Daily Trend**")
