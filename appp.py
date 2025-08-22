@@ -9,7 +9,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 # ------------------------------ Page ---------------------------------
-st.set_page_config(page_title="Fraud Review – Business Dashboard", layout="wide")
+st.set_page_config(page_title="Fraud Review Dashboard", layout="wide")
 alt.renderers.set_embed_options(actions=False)
 
 PRIMARY, GOOD, WARN, BAD, MUTED = "#2563eb", "#16a34a", "#f59e0b", "#dc2626", "#64748b"
@@ -31,7 +31,7 @@ with st.sidebar:
     st.header("BigQuery")
     PROJ = st.text_input("Project", "mss-data-engineer-sandbox")
     DATASET = st.text_input("Dataset", "retail")
-    TABLE = st.text_input("Raw table", f"{PROJ}.{DATASET}.transactions_cleaned")
+    TABLE = st.text_input("Raw table", f"{PROJ}.{DATASET}.transaction_data")
     S = st.date_input("Start date", date(2023,1,1))
     E = st.date_input("End date",   date(2030,12,31))
     st.caption("Pulls raw rows between Start/End from the specified table.")
@@ -360,4 +360,5 @@ if submitted:
         "Price ratio vs category": round(price_ratio,2),
         "Account age (days)": int(acct_age)
     }]))
+
 
