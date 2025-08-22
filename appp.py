@@ -11,7 +11,7 @@ st.set_page_config("Fraud Dashboard (Calibrated, TH slider)", layout="wide")
 alt.renderers.set_embed_options(actions=False)
 RANDOM_STATE = 42
 
-# ───────────── Sidebar ─────────────
+# ───────────────── Sidebar ─────────────────
 with st.sidebar:
     st.header("BigQuery")
     PROJ = st.text_input("Project", "mss-data-engineer-sandbox")
@@ -20,14 +20,15 @@ with st.sidebar:
     S = st.date_input("Start", date(2023,1,1))
     E = st.date_input("End",  date(2030,12,31))
     TH = st.slider("Decision threshold", 0.01, 0.99, 0.30, 0.01)
+    OPT = st.selectbox("Optimize threshold for", ["Balanced accuracy", "F1", "Accuracy"], index=0)
     st.caption("Scores are **calibrated** so your chosen threshold (default 0.30) matches the validated operating point.")
 
-# ───────────── GCP client ──────────
-sa = dict(st.secrets["gcp_service_account"]); sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+# ───────────────── BigQuery client ─────────────────
+sa = dict(st.secrets["gcp_service_account"]); sa["private_key"] = sa["private_key"].replace("\\n","\n")
 creds = service_account.Credentials.from_service_account_info(sa)
 bq = bigquery.Client(credentials=creds, project=creds.project_id)
 
-# ───────────── Load data ───────────
+# ───────────────── Load data ─────────────────
 @st.cache_data(show_spinner=True)
 def load_raw(raw, s, e):
     sql = f"""
@@ -50,7 +51,7 @@ def load_raw(raw, s, e):
 df = load_raw(RAW, S, E)
 if df.empty: st.warning("No rows in this date range."); st.stop()
 
-# ───────────── Cleaning ────────────
+# ───────────────── Cleaning ─────────────────
 df = df.sort_values("ts").drop_duplicates("order_id", keep="last")
 df = df[(df.q>0)&(df.p>0)].copy()
 df["ts"]   = pd.to_datetime(df["ts"],   errors="coerce", utc=True).dt.tz_localize(None)
@@ -63,7 +64,7 @@ def wins(g,col):
 for c in ["p","q"]: df = df.groupby("sku_category", group_keys=False).apply(wins, col=c)
 df["amt"]=df.q*df.p
 
-# ───────── Feature engineering ─────
+# ───────────────── Feature engineering ─────────────────
 cat_avg = df.groupby("sku_category")["p"].transform("mean").replace(0,np.nan)
 df["price_ratio"] = (df["p"]/cat_avg).fillna(1.0)
 den=df["amt"].replace(0,np.nan); df["coup_pct"]=(df["coup"]/den).fillna(0); df["gift_pct"]=(df["gift_amt"]/den).fillna(0)
@@ -83,7 +84,7 @@ df["dev_1h"]=df.groupby("dev",group_keys=False).apply(vel_last_hours,1)
 def roll_stats(g):
     g=g.sort_values("ts"); r=g["amt"].rolling(10,min_periods=1); g["c_m"]=r.mean(); g["c_s"]=r.std(ddof=0).replace(0,np.nan); return g
 df=df.groupby("customer_id",group_keys=False).apply(roll_stats)
-df["z"]=((df["amt"]-df["c_m"])/df["c_s"]).replace([np.inf,-np.inf],0).fillna(0)
+df["z"]=((df["amt"]-df["c_m"]) / df["c_s"]).replace([np.inf,-np.inf],0).fillna(0)
 p90=float(np.nanpercentile(df["amt"],90)) if len(df) else 0.0
 
 df["s_price_bulk"]=((df["price_ratio"].sub(1).abs()>=.5)&(df["q"]>=3)).astype(int)
@@ -93,7 +94,7 @@ df["s_z"]=(df["z"].abs()>=2).astype(int)
 df["s_geo_hi"]=((df["geo"]==1)&(df["amt"]>=p90)).astype(int)
 df["s_any"]=(df[["s_price_bulk","s_gc_geo","s_burst","s_z","s_geo_hi"]].sum(axis=1)>0).astype(int)
 
-# ───────── Train + global calibration ───────
+# ───────────────── Train + global calibration ─────────────────
 labeled=df[df.y.isin([0,1])].copy()
 if labeled["y"].nunique()<2: st.error("Labeled data must contain both classes (0/1)."); st.stop()
 
@@ -108,22 +109,30 @@ X=pd.concat([Xn,Xc],axis=1); y=labeled["y"].astype(int).values
 cat_dummies=list(Xc.columns)
 
 @st.cache_data(show_spinner=False)
-def cv_calibrate_threshold(X,y,TH,n_splits=3,max_iter=200):
-    skf=StratifiedKFold(n_splits=n_splits,shuffle=True,random_state=RANDOM_STATE)
+def cv_calibrate_threshold(X, y, TH, opt="Balanced accuracy", n_splits=3, max_iter=200, min_precision=0.25):
+    skf=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
     probs=np.zeros(len(y))
     for tr,va in skf.split(X,y):
-        clf=HistGradientBoostingClassifier(max_iter=max_iter,learning_rate=.1,
-                                           early_stopping=True,random_state=RANDOM_STATE)
+        clf=HistGradientBoostingClassifier(max_iter=max_iter, learning_rate=.1,
+                                           early_stopping=True, random_state=RANDOM_STATE)
         clf.fit(X.iloc[tr],y[tr]); probs[va]=clf.predict_proba(X.iloc[va])[:,1]
-    ts=np.linspace(.01,.99,99); best_t, best_f1=0.5,-1
+    ts=np.linspace(.01,.99,99); best_t, best_score=0.50,-1.0
+    pos=(y==1).sum(); neg=(y==0).sum()
     for t in ts:
         yhat=(probs>=t).astype(int)
-        p=precision_score(y,yhat,zero_division=0); r=recall_score(y,yhat,zero_division=0)
-        f1=0 if p+r==0 else 2*p*r/(p+r)
-        if f1>best_f1: best_f1, best_t=f1, t
+        tp=int(((y==1)&(yhat==1)).sum()); tn=int(((y==0)&(yhat==0)).sum())
+        fp=int(((y==0)&(yhat==1)).sum()); fn=int(((y==1)&(yhat==0)).sum())
+        prec=0 if (tp+fp)==0 else tp/(tp+fp); rec=0 if pos==0 else tp/pos
+        acc=(tp+tn)/max(1,len(y)); tnr=0 if neg==0 else tn/neg; bal=0.5*(rec+tnr)
+        f1=0 if prec+rec==0 else 2*prec*rec/(prec+rec)
+        if prec < min_precision:  # avoid the "flag everything" regime
+            continue
+        score={"Balanced accuracy":bal, "F1":f1, "Accuracy":acc}[opt]
+        if score>best_score: best_score, best_t=score, t
+    if best_score<0: best_t=0.50  # fallback
     return best_t, (TH/best_t if best_t>0 else 1.0)
 
-t_star, scale = cv_calibrate_threshold(X, y, TH)
+t_star, scale = cv_calibrate_threshold(X, y, TH, OPT)
 
 @st.cache_resource(show_spinner=False)
 def fit_final_model(X,y,max_iter=200):
@@ -140,7 +149,7 @@ def score_all(D):
 
 df["score"]=score_all(df)
 
-# safe-case suppressor (helps overall accuracy/precision)
+# safe-case suppressor → boosts precision/accuracy
 safe=((df["amt"]<=100)&(df["q"]<=2)&(df["ship"]==df["ip"])&
       (df["gift_pct"]<.05)&(df["price_ratio"].sub(1).abs()<=.15)&
       (df["s_price_bulk"]==0)&(df["s_gc_geo"]==0)&(df["s_burst"]==0)&
@@ -149,16 +158,16 @@ safe=((df["amt"]<=100)&(df["q"]<=2)&(df["ship"]==df["ip"])&
 df["alert_raw"]=(df["score"]>=TH).astype(int)
 df["alert"]=((df["score"]>=TH)&(~safe)).astype(int)
 
-# ───────── KPIs ─────────
+# ───────────────── KPIs ─────────────────
 st.subheader(f"**Key Metrics (Threshold = {TH:.2f})**")
-TOT, AL=len(df), int(df["alert"].sum())
-c1,c2,c3=st.columns(3)
-c1.metric("**Total transactions**",TOT)
-c2.metric(f"**Fraud alerts (≥{TH:.2f})**",AL)
-c3.metric("**Alert rate**",f"{AL/max(1,TOT):.2%}")
-st.caption(f"Calibration: best-F1 threshold t*≈{t_star:.2f} → scaled so decisions occur at {TH:.2f}.")
+TOT, AL = len(df), int(df["alert"].sum())
+c1,c2,c3 = st.columns(3)
+c1.metric("**Total transactions**", TOT)
+c2.metric(f"**Fraud alerts (≥{TH:.2f})**", AL)
+c3.metric("**Alert rate**", f"{AL/max(1,TOT):.2%}")
+st.caption(f"Calibration (**{OPT}**): best threshold t*≈{t_star:.2f} → scores scaled so decisions occur at {TH:.2f}.")
 
-# ───────── Trend & distribution ─────
+# ───────────────── Trend & distribution ─────────────────
 st.subheader("**Daily Trend**")
 df["day"]=pd.to_datetime(df["ts"]).dt.date
 trend=df.groupby("day").agg(total=("order_id","count"), alerts=("alert","sum")).reset_index()
@@ -168,19 +177,19 @@ if not trend.empty:
 
 st.subheader("**Fraud Score Distribution**")
 st.altair_chart(
-    alt.Chart(df).mark_bar().encode(x=alt.X("score:Q",bin=alt.Bin(maxbins=50)),y="count()").properties(height=200)
+    alt.Chart(df).mark_bar().encode(x=alt.X("score:Q",bin=alt.Bin(maxbins=50)), y="count()").properties(height=200)
     + alt.Chart(pd.DataFrame({"x":[TH]})).mark_rule(color="red").encode(x="x"),
     use_container_width=True
 )
 
-# ───────── Top alerts (show ALL) ───
+# ───────────────── Top Alerts (ALL rows) ─────────────────
 st.subheader(f"**Top Alerts (score ≥ {TH:.2f})**")
 cols=[c for c in ["order_id","ts","customer_id","store_id","sku_id","sku_category","amt","q","pay","ship","ip","score"] if c in df]
 top=df[df["alert"]==1].sort_values(["score","ts"],ascending=[False,False]).drop_duplicates("order_id")
 st.caption(f"Showing **all {len(top)}** alerts.")
-st.dataframe(top.loc[:,cols], use_container_width=True, height=min(600, 35*max(5,len(top))))
+st.dataframe(top.loc[:,cols], use_container_width=True, height=min(700, 35*max(5,len(top))))
 
-# ───────── Evaluation (BOTTOM) ─────
+# ───────────────── Evaluation (BOTTOM) ─────────────────
 st.subheader(f"**Model Evaluation (fixed threshold = {TH:.2f})**")
 st.caption("Precision = among alerts, % truly fraud; Recall = of all fraud, % caught; F1 = balance; Accuracy = overall correctness.")
 y_true=labeled["y"].astype(int).values
