@@ -30,7 +30,7 @@ with st.sidebar:
     E  = st.date_input("End",   date(2024,12,31))
 
     # WHAT-IF slider: used only for charts (distribution/ops helper)
-    TH_VIEW = st.slider("WHAT-IF THRESHOLD (FOR CHARTS ONLY)", 0.00, 1.00, 0.30, 0.01)
+    TH_VIEW = st.slider("WHAT-IF THRESHOLD ", 0.00, 1.00, 0.30, 0.01)
 # ───────────────────────── BIGQUERY CLIENT ───────────────────────────
 sa = dict(st.secrets["gcp_service_account"])
 sa["private_key"] = sa["private_key"].replace("\\n", "\n")
@@ -328,3 +328,4 @@ st.altair_chart(
     ).properties(height=200, title=("BIGQUERY METRICS" if use_bq else "LOCAL FALLBACK")),
     use_container_width=True
 )
+
