@@ -84,17 +84,17 @@ yhat = (probs >= best_t).astype(int)
 st.title("Retail Fraud Detection")
 
 # Raw data
-st.subheader("📦 Raw 4,000 Transactions Snapshot")
+st.subheader("Raw 4,000 Transactions Snapshot")
 st.dataframe(raw.head(200), use_container_width=True, height=300)
 st.caption("Showing first 200 of 4,000 for readability.")
 
 # Channel mix
-st.subheader("💳 Channel Mix")
+st.subheader("Channel Mix")
 mix = df.groupby("payment_channel")["order_id"].count().reset_index()
 st.bar_chart(mix.set_index("payment_channel"))
 
 # Model evaluation
-st.subheader("📊 Model Evaluation (test set)")
+st.subheader(" Model Evaluation (test set)")
 c1,c2,c3,c4 = st.columns(4)
 c1.metric("Accuracy",  f"{accuracy_score(yte,yhat):.2%}")
 c2.metric("Precision", f"{precision_score(yte,yhat,zero_division=0):.2%}")
@@ -102,7 +102,7 @@ c3.metric("Recall",    f"{recall_score(yte,yhat,zero_division=0):.2%}")
 c4.metric("F1-score",  f"{f1_score(yte,yhat,zero_division=0):.2%}")
 
 # ───────────────── New Order ─────────────────
-st.subheader("🛒 New Order – Instant Decision")
+st.subheader("New Order – Instant Decision")
 
 c1,c2,c3 = st.columns(3)
 cat = c1.selectbox("Category", df["sku_category"].unique())
@@ -142,4 +142,5 @@ if st.button("Check Fraud"):
     pred=int((clf.predict_proba(Xin)[:,1]>=best_t)[0])
     label="Fraud" if pred else "Not Fraud"
     st.markdown(f"### Decision: **{label}**")
+
 
