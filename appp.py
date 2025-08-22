@@ -1,8 +1,7 @@
 # app.py — streamlit run app.py
-# Goal: keep production cut at 0.30, but lift overall Accuracy (≥75%) and Recall (≈80–90%)
-# Tactics: (1) class-weighted boosted trees, (2) probability scaling (internal calibration)
-#          (3) high-recall rule force-alerts, (4) risk gate, (5) strong low-risk suppressor
-# Notes: no calibration UI is shown; only a "what-if" threshold slider (default 0.30).
+# Goal: keep PROD cut fixed at 0.30, but push overall Accuracy ≥~75% while Recall stays ~80–90%.
+# How: class-weighted boosted trees + CV scaling so 0.30 behaves like the best valid cut;
+#      2-of-N risk gate for score alerts; strong force-alerts; strong low-risk suppression.
 
 import streamlit as st, pandas as pd, numpy as np, altair as alt
 from datetime import date
@@ -12,10 +11,10 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-st.set_page_config("Fraud Dashboard (Fixed 0.30 — High-Recall + High-Precision)", layout="wide")
+st.set_page_config("Fraud Dashboard (Fixed 0.30 — High Accuracy & Recall)", layout="wide")
 alt.renderers.set_embed_options(actions=False)
 RNG = 42
-PROD_THRESHOLD = 0.30  # business decision point
+PROD_THRESHOLD = 0.30  # business decision point (fixed)
 
 # ───────────── Sidebar ─────────────
 with st.sidebar:
@@ -26,7 +25,7 @@ with st.sidebar:
     S = st.date_input("Start", date(2023,1,1))
     E = st.date_input("End",  date(2030,12,31))
     TH = st.slider("Decision threshold (what-if view)", 0.01, 0.99, PROD_THRESHOLD, 0.01)
-    st.caption("Production decisions stay fixed at **0.30**. The slider only lets you see impact.")
+    st.caption("Production decisions stay fixed at **0.30**; slider is for what-if viewing only.")
 
 # ───────────── GCP client ──────────
 sa = dict(st.secrets["gcp_service_account"]); sa["private_key"]=sa["private_key"].replace("\\n","\n")
@@ -80,7 +79,7 @@ df["geo"] = (df["ship"] != df["ip"]).astype(int)
 df["hour"] = pd.to_datetime(df["ts"]).dt.hour
 df["dow"]  = pd.to_datetime(df["ts"]).dt.dayofweek
 
-# lightweight payment risk score
+# payment risk (coarse)
 _pay_risk = {"crypto":3,"paypal":2,"credit_card":2,"apple_pay":2,"google_pay":2,
              "bank_transfer":0,"debit_card":1,"cod":0}
 df["pay_risk"] = df["pay"].map(_pay_risk).fillna(1).astype(int)
@@ -105,7 +104,7 @@ df = df.groupby("customer_id", group_keys=False).apply(roll_stats)
 df["z"] = ((df["amt"]-df["c_m"])/df["c_s"]).replace([np.inf,-np.inf],0).fillna(0)
 p90 = float(np.nanpercentile(df["amt"],90)) if len(df) else 0.0
 
-# strong patterns (high recall)
+# strong patterns (for recall protection)
 df["s_price_bulk"] = ((df["price_ratio"].sub(1).abs()>=.50)&(df["q"]>=3)).astype(int)
 df["s_gc_geo"]     = ((df["gift_used"].fillna(False))&(df["geo"]==1)).astype(int)
 df["s_burst"]      = ((df["cust_1h"]>=3)|(df["dev_1h"]>=3)).astype(int)
@@ -113,7 +112,7 @@ df["s_z"]          = (df["z"].abs()>=2).astype(int)
 df["s_geo_hi"]     = ((df["geo"]==1)&(df["amt"]>=p90)).astype(int)
 df["s_any"]        = (df[["s_price_bulk","s_gc_geo","s_burst","s_z","s_geo_hi"]].sum(axis=1)>0).astype(int)
 
-# ───────── Train (class-weighted) + internal scaling ────────
+# ───────── Train (class-weighted) + CV scaling ────────
 labeled = df[df.y.isin([0,1])].copy()
 if labeled["y"].nunique()<2: st.error("Labeled data must contain both classes (0/1)."); st.stop()
 
@@ -128,20 +127,20 @@ X  = pd.concat([Xn,Xc],axis=1); y=labeled["y"].astype(int).values
 cat_dummies = list(Xc.columns)
 
 pos = max(1,int((y==1).sum())); neg = max(1,len(y)-pos)
-w_pos = min(10.0, neg/pos)  # cap
+w_pos = min(12.0, neg/pos)  # a bit stronger weighting
 
 @st.cache_data(show_spinner=False)
-def fit_and_scale(X, y, w_pos, target_metric="balanced", min_prec=0.25):
-    # cross-val probabilities
+def fit_and_scale(X, y, w_pos, min_prec=0.45, min_rec=0.80, target="acc"):
+    # 3-fold CV to get out-of-fold probabilities
     skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=RNG)
     probs = np.zeros(len(y))
     for tr,va in skf.split(X,y):
-        m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.1,
+        m = HistGradientBoostingClassifier(max_iter=400, learning_rate=0.08,
                                            early_stopping=True, random_state=RNG)
         sw = np.where(y[tr]==1, w_pos, 1.0)
         m.fit(X.iloc[tr], y[tr], sample_weight=sw)
         probs[va] = m.predict_proba(X.iloc[va])[:,1]
-    # choose operating threshold t* on CV probs, then map to 0.30 via scaling
+    # choose t* that maximizes accuracy subject to precision>=min_prec & recall>=min_rec
     ts = np.linspace(0.01,0.99,99)
     best_t, best_s = 0.5, -1
     P, N = (y==1).sum(), (y==0).sum()
@@ -151,23 +150,21 @@ def fit_and_scale(X, y, w_pos, target_metric="balanced", min_prec=0.25):
         fp = int(((y==0)&(yh==1)).sum()); fn=int(((y==1)&(yh==0)).sum())
         prec = 0 if tp+fp==0 else tp/(tp+fp)
         rec  = 0 if P==0 else tp/P
-        tnr  = 0 if N==0 else tn/N
-        bal  = 0.5*(rec+tnr); f1 = 0 if (prec+rec)==0 else 2*prec*rec/(prec+rec)
         acc  = (tp+tn)/max(1,len(y))
-        if prec < min_prec:  # keep precision sensible
-            continue
-        score = {"balanced":bal,"f1":f1,"acc":acc}[target_metric]
-        if score>best_s: best_s, best_t = score, t
-    scale = PROD_THRESHOLD/max(best_t,1e-6)  # so 0.30 acts like t*
+        if prec >= min_prec and rec >= min_rec and acc > best_s:
+            best_s, best_t = acc, t
+    if best_s < 0:  # fallback: balanced cut if constraints impossible
+        best_t = 0.50
+    scale = PROD_THRESHOLD/max(best_t,1e-6)  # map t* → 0.30
     return scale
 
-scale = fit_and_scale(X, y, w_pos, target_metric="balanced", min_prec=0.25)
+scale = fit_and_scale(X, y, w_pos, min_prec=0.45, min_rec=0.80, target="acc")
 
 @st.cache_resource(show_spinner=False)
 def fit_final(X, y, w_pos):
-    m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.1,
+    m = HistGradientBoostingClassifier(max_iter=400, learning_rate=0.08,
                                        early_stopping=True, random_state=RNG)
-    sw = np.where(y==1, w_pos, 1.0); m.fit(X,y,sample_weight=sw); return m
+    sw = np.where(y==1, w_pos, 1.0); m.fit(X, y, sample_weight=sw); return m
 
 final_clf = fit_final(X, y, w_pos)
 
@@ -178,10 +175,10 @@ def score_all(D):
 
 df["score"] = score_all(df)
 
-# ───────── Decisions @ threshold (recall protected + precision gated) ─────────
+# ───────── Decisions (recall protected + precision gated) ─────────
 alert_score = (df["score"] >= TH)
 
-# Force-alerts (recall pillar)
+# Force-alerts (protect recall)
 force_alert = (
     (df["s_any"]==1) |
     ((df["geo"]==1) & ((df["dev_1h"]>=2)|(df["cust_24h"]>=2))) |
@@ -189,17 +186,20 @@ force_alert = (
     ((df["coup_pct"]>=0.40) & (df["amt"]>=max(1,p90*0.5)))
 )
 
-# Risk gate for score-based alerts
-risk_gate = (
-    (df["geo"]==1) |
-    (df["cust_24h"]>=2) | (df["dev_1h"]>=2) |
-    (df["price_ratio"].sub(1).abs()>=0.20) |
-    (df["pay_risk"]>=2) |
-    (df["coup_pct"]>=0.20) | (df["gift_pct"]>=0.40) |
-    (df["amt"]>=p90)
-)
+# 2-of-N risk gate for score-only alerts  → large FP reduction → accuracy↑
+risk_bits = pd.DataFrame({
+    "geo": (df["geo"]==1).astype(int),
+    "vel": ((df["cust_24h"]>=2)|(df["dev_1h"]>=2)).astype(int),
+    "price": (df["price_ratio"].sub(1).abs()>=0.25).astype(int),
+    "promo": (df["coup_pct"]>=0.20).astype(int),
+    "gift": (df["gift_pct"]>=0.40).astype(int),
+    "hiamt": (df["amt"]>=p90).astype(int),
+    "pay": (df["pay_risk"]>=2).astype(int),
+})
+risk_count = risk_bits.sum(axis=1)
+risk_gate = (risk_count >= 2)
 
-# Strong low-risk suppression
+# Strong low-risk suppression (precision pillar)
 low_risk = (
     (df["amt"]<=120) & (df["q"]<=2) & (df["geo"]==0) &
     (df["cust_24h"]<=1) & (df["dev_1h"]<=1) &
@@ -220,8 +220,8 @@ c1,c2,c3 = st.columns(3)
 c1.metric("**Total transactions**", TOT)
 c2.metric(f"**Fraud alerts (≥{TH:.2f})**", AL)
 c3.metric("**Alert rate**", f"{AL/max(1,TOT):.2%}")
-st.caption("Ensemble policy = class-weighted model + internal scaling → 0.30, "
-           "force-alerts for strong fraud, risk-gated score alerts, and low-risk suppression.")
+st.caption("Policy: class-weighted model + CV scaling to 0.30 • force-alerts for strong fraud • "
+           "2-of-N risk gate for score alerts • strong low-risk suppression.")
 
 # Trend
 st.subheader("**Daily Trend**")
@@ -248,7 +248,7 @@ top=df[df["alert"]==1].sort_values(["score","ts"],ascending=[False,False]).drop_
 st.caption(f"Showing **all {len(top)}** alerts.")
 st.dataframe(top.loc[:,cols], use_container_width=True, height=min(700, 35*max(5,len(top))))
 
-# Evaluation at bottom (only on labeled rows)
+# Evaluation (bottom, on labeled rows only)
 st.subheader(f"**Model Evaluation (threshold = {TH:.2f})**")
 st.caption("Precision = among alerts, % truly fraud • Recall = of all fraud, % caught • F1 = balance • Accuracy = overall correctness.")
 y_true = labeled["y"].astype(int).values
