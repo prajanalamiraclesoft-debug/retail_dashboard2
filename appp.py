@@ -1,138 +1,96 @@
-# app.py — streamlit run app.py
 import streamlit as st, pandas as pd, numpy as np, altair as alt
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from datetime import date
+from google.cloud import bigquery; from google.oauth2 import service_account
+from sklearn.metrics import confusion_matrix, roc_curve, roc_auc_score, precision_recall_curve, auc, accuracy_score, precision_score, recall_score, f1_score
+st.set_page_config("Retail Dashboard: Fraud & Inventory", layout="wide"); alt.data_transformers.enable("default", max_rows=None); alt.renderers.set_embed_options(actions=False)
 
-st.set_page_config("Retail Fraud", layout="wide")
-alt.renderers.set_embed_options(actions=False)
-RND = 42
+with st.sidebar:
+    st.header("BQ Table Info"); P=st.text_input("Project","mss-data-engineer-sandbox"); D=st.text_input("Dataset","retail")
+    PT=st.text_input("Predictions",f"{P}.{D}.predictions_latest"); FT=st.text_input("Features",f"{P}.{D}.features_signals_v4")
+    MT=st.text_input("Metrics (optional)",f"{P}.{D}.predictions_daily_metrics"); S=st.date_input("Start",date(2023,1,1)); E=st.date_input("End",date(2024,12,31)); TH=st.slider("Alert threshold (≥)",0.00,1.00,0.30,0.01)
 
-# -------- Sidebar (read-only source) --------
-st.sidebar.header("Data source")
-st.sidebar.text_input("Project", "mss-data-engineer-sandbox", disabled=True)
-st.sidebar.text_input("Dataset", "retail", disabled=True)
-st.sidebar.text_input("Raw table", "mss-data-engineer-sandbox.retail.transaction_data", disabled=True)
+#BigQuery
+sa=dict(st.secrets["gcp_service_account"]); sa["private_key"]=sa["private_key"].replace("\\n","\n")
+creds=service_account.Credentials.from_service_account_info(sa); bq=bigquery.Client(credentials=creds, project=creds.project_id)
 
-# -------- Step 1. Load fixed 4k dataset --------
-@st.cache_data
-def load_data():
-    np.random.seed(RND)
-    rows = 4000
-    df = pd.DataFrame({
-        "order_id": [f"o{i}" for i in range(rows)],
-        "ts": pd.date_range("2023-01-01", periods=rows, freq="H"),
-        "customer_id": np.random.choice([f"c{i}" for i in range(200)], rows),
-        "store_id": np.random.choice([f"s{i}" for i in range(10)], rows),
-        "device_id": np.random.choice([f"d{i}" for i in range(50)], rows),
-        "sku_id": np.random.choice([f"sku{i}" for i in range(100)], rows),
-        "sku_category": np.random.choice(["grocery","electronics","apparel","home","toys"], rows),
-        "quantity": np.random.randint(1,5,rows),
-        "unit_price": np.random.uniform(5,500,rows).round(2),
-        "payment_channel": np.random.choice(["Card","Wallet","GiftCard"], rows),   # <— renamed
-        "ship_country": np.random.choice(["US","CA","UK","DE","IN"], rows),
-        "ip_country":   np.random.choice(["US","CA","UK","DE","IN"], rows),
-        "account_age_days": np.random.randint(0,1000,rows),
-        "coupon_discount": np.random.choice([0,0,0,10,20,50], rows),
-        "gift_balance_used": np.random.choice([0,0,0,5,25,100], rows),
-    })
-    # Synthetic label (rules)
-    df["fraud_flag"] = (
-        ((df["ship_country"] != df["ip_country"]) & (df["unit_price"] > 300)) |
-        ((df["coupon_discount"] > 20) & (df["gift_balance_used"] > 50)) |
-        ((df["quantity"] >= 3) & (df["unit_price"] > 200))
-    ).astype(int)
-    # make it realistic (avoid perfect metrics)
-    flip = np.random.rand(rows) < 0.05   # 5% noise
-    df.loc[flip, "fraud_flag"] = 1 - df.loc[flip, "fraud_flag"]
-    return df
+@st.cache_data(show_spinner=True)
+def load_df(PT,FT,S,E):
+    sql=f"""SELECT p.order_id,p.timestamp,p.customer_id,p.store_id,p.sku_id,p.sku_category,p.order_amount,p.quantity,p.payment_method,p.shipping_country,p.ip_country,CAST(p.fraud_score AS FLOAT64) fraud_score,
+    s.strong_tri_mismatch_high_value,s.strong_high_value_express_geo,s.strong_burst_multi_device,s.strong_price_drop_bulk,s.strong_giftcard_geo,s.strong_return_whiplash,s.strong_price_inventory_stress,s.strong_country_flip_express,
+    s.high_price_anomaly,s.low_price_anomaly,s.oversell_flag,s.stockout_risk_flag,s.hoarding_flag,SAFE_CAST(s.fraud_flag AS INT64) fraud_flag
+    FROM `{PT}` p LEFT JOIN `{FT}` s USING(order_id) WHERE DATE(p.timestamp) BETWEEN @S AND @E ORDER BY p.timestamp"""
+    j=bq.query(sql,job_config=bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("S","DATE",str(S)),bigquery.ScalarQueryParameter("E","DATE",str(E))]))
+    d=j.result().to_dataframe(); d["timestamp"]=pd.to_datetime(d["timestamp"],errors="coerce").dt.tz_localize(None); return d
 
-raw = load_data()
+df=load_df(PT,FT,S,E)
+if df.empty: st.warning("No rows in this window."); st.stop()
+df["fraud_score"]=pd.to_numeric(df["fraud_score"],errors="coerce").fillna(0.0); df["is_alert"]=(df["fraud_score"]>=TH).astype(int); df["day"]=df["timestamp"].dt.floor("D")
 
-# -------- Step 2. Features (keep business-friendly) --------
-df = raw.copy()
-df["order_amount"] = df["quantity"] * df["unit_price"]
-cat_avg = df.groupby("sku_category")["unit_price"].transform("mean").replace(0,np.nan)
-df["price_ratio"] = (df["unit_price"]/cat_avg).fillna(1.0)
-df["geo_mismatch"] = (df["ship_country"] != df["ip_country"]).astype(int)
-df["coupon_pct"] = (df["coupon_discount"]/df["order_amount"].replace(0,np.nan)).fillna(0)
-df["gift_pct"]   = (df["gift_balance_used"]/df["order_amount"].replace(0,np.nan)).fillna(0)
+# KPIs
+c1,c2,c3,c4=st.columns([1,1,1,2]); TOT=len(df); AL=int(df["is_alert"].sum()); c1.metric("Scored",TOT); c2.metric("Alerts",AL); c3.metric("Alert rate",f"{(AL/TOT if TOT else 0):.2%}")
+c4.caption(f"Window: {df['timestamp'].min()} → {df['timestamp'].max()} | Threshold: {TH:.2f}"); st.markdown("---")
 
-# -------- Step 3. Train / Test --------
-cut = int(len(df)*0.75)  # time split
-train, test = df.iloc[:cut], df.iloc[cut:]
+# Trend
+st.subheader("Daily trend")
+tr=df.groupby("day").agg(scored=("order_id","count"),alerts=("is_alert","sum")).reset_index()
+if len(tr):
+    tl=tr.melt(id_vars="day", value_vars=["scored","alerts"], var_name="series", value_name="value")
+    st.altair_chart(alt.Chart(tl).mark_line(point=True).encode(x="day:T",y="value:Q",color="series:N",tooltip=[alt.Tooltip("day:T"),"series:N",alt.Tooltip("value:Q")]).properties(height=260),use_container_width=True)
+else: st.info("No activity.")
 
-# Use ONLY base features to avoid leakage
-feat_num = ["order_amount","quantity","unit_price","account_age_days",
-            "price_ratio","coupon_pct","gift_pct","geo_mismatch"]
-feat_cat = ["payment_channel","sku_category","ship_country","ip_country","store_id"]
+# -------- Score distribution --------
+st.subheader("Fraud-score distribution")
+h=alt.Chart(df).mark_bar().encode(x=alt.X("fraud_score:Q",bin=alt.Bin(maxbins=50),title="Fraud score"),y=alt.Y("count():Q",title="Rows"),tooltip=[alt.Tooltip("count()",title="Rows")]).properties(height=200)
+st.altair_chart(h+alt.Chart(pd.DataFrame({"x":[TH]})).mark_rule(color="crimson").encode(x="x"),use_container_width=True)
 
-Xtr = pd.concat([train[feat_num].fillna(0),
-                 pd.get_dummies(train[feat_cat].astype(str))], axis=1)
-ytr = train["fraud_flag"].values
-Xte = pd.concat([test[feat_num].fillna(0),
-                 pd.get_dummies(test[feat_cat].astype(str))], axis=1).reindex(columns=Xtr.columns, fill_value=0)
-yte = test["fraud_flag"].values
-cols_model = Xtr.columns
+# -------- Signal prevalence --------
+def prev(cols,title):
+    cols=[c for c in cols if c in df]; 
+    if not cols: st.info(f"No signals for: {title}"); return
+    z=df[["is_alert"]+cols].apply(pd.to_numeric,errors="coerce").fillna(0).astype(int); a=int(z["is_alert"].sum()) or 1; na=int((1-z["is_alert"]).sum()) or 1
+    rows=[{"signal":c,"% in alerts":z.loc[z.is_alert==1,c].sum()/a,"% in non-alerts":z.loc[z.is_alert==0,c].sum()/na} for c in cols]
+    dd=pd.DataFrame(rows).sort_values("% in alerts",ascending=False).melt(id_vars="signal",var_name="group",value_name="value")
+    st.altair_chart(alt.Chart(dd).mark_bar().encode(x=alt.X("value:Q",axis=alt.Axis(format="%"),title="Prevalence"),y=alt.Y("signal:N",sort="-x",title=None),color="group:N",tooltip=["signal:N",alt.Tooltip("value:Q",format=".1%"),"group:N"]).properties(title=title,height=300),use_container_width=True)
 
-clf = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.08, random_state=RND)
-clf.fit(Xtr, ytr)
-probs = clf.predict_proba(Xte)[:,1]
-THRESH = 0.30
-yhat = (probs >= THRESH).astype(int)
+st.subheader("Context signals"); l,r=st.columns(2)
+with l: prev(["strong_tri_mismatch_high_value","strong_high_value_express_geo","strong_burst_multi_device","strong_price_drop_bulk","strong_giftcard_geo","strong_return_whiplash","strong_price_inventory_stress","strong_country_flip_express"],"Strong-signal prevalence")
+with r: prev(["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_flag","hoarding_flag"],"Pricing & Inventory prevalence")
 
-# -------- Dashboard --------
-st.title("Retail Fraud Detection")
+# Correlations
+st.caption("Correlation of fraud_score with pricing/inventory signals (Pearson)")
+C=[c for c in ["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_flag","hoarding_flag"] if c in df]
+if C: co=df[["fraud_score"]+C].apply(pd.to_numeric,errors="coerce").fillna(0).corr().loc[C,"fraud_score"].reset_index().rename(columns={"index":"signal","fraud_score":"corr"}); st.altair_chart(alt.Chart(co).mark_bar().encode(x="corr:Q",y=alt.Y("signal:N",sort="x",title=None),tooltip=[alt.Tooltip("corr:Q",format=".3f")]).properties(height=120),use_container_width=True)
+else: st.info("No pricing/inventory columns to correlate.")
 
-# 4,000 rows (scrollable)
-st.subheader("Raw 4,000 Transactions")
-st.dataframe(raw, use_container_width=True, height=420)   # <— ALL rows (scroll)
+# Top alerts
+st.subheader("Top alerts"); cols=[c for c in ["order_id","timestamp","customer_id","store_id","sku_id","sku_category","order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"] if c in df]
+st.dataframe(df.sort_values(["fraud_score","timestamp"],ascending=[False,False]).loc[:,cols].head(50),use_container_width=True,height=320)
 
-# Channel mix (what % of orders by channel)
-st.subheader("Channel Mix")
-mix = df.groupby("payment_channel", as_index=False)["order_id"].count().rename(columns={"order_id":"orders"})
-st.bar_chart(mix.set_index("payment_channel"))
-st.caption("Orders broken out by Card / Wallet / GiftCard.")
+#Evaluation
+st.subheader("Model evaluation"); L=[c for c in ["fraud_flag","is_fraud","label","ground_truth","gt","y"] if c in df]
+if L: lab=st.selectbox("Ground-truth (1=fraud,0=legit)",L,0); y_true=df[lab].fillna(0).astype(int).values; st.caption(f"Using: `{lab}`")
+else: st.warning("No label column; using decision as proxy."); y_true=(df["fraud_score"]>=TH).astype(int).values
+y_pred=(df["fraud_score"]>=TH).astype(int).values; y_score=df["fraud_score"].values
+m1,m2,m3,m4=st.columns(4); m1.metric("Accuracy",f"{accuracy_score(y_true,y_pred):.2%}"); m2.metric("Precision",f"{precision_score(y_true,y_pred,zero_division=0):.2%}"); m3.metric("Recall",f"{recall_score(y_true,y_pred,zero_division=0):.2%}"); m4.metric("F1-score",f"{f1_score(y_true,y_pred,zero_division=0):.2%}")
+cm=confusion_matrix(y_true,y_pred,labels=[0,1]); cm_long=pd.DataFrame(cm,index=["Actual: 0","Actual: 1"],columns=["Pred: 0","Pred: 1"]).reset_index().melt(id_vars="index",var_name="Predicted",value_name="Count").rename(columns={"index":"Actual"})
+st.altair_chart(alt.Chart(cm_long).mark_rect().encode(x="Predicted:N",y="Actual:N",color=alt.Color("Count:Q",scale=alt.Scale(scheme="blues"))).properties(height=180),use_container_width=True)
+try: A=roc_auc_score(y_true,y_score)
+except: A=float("nan")
+fpr,tpr,_=roc_curve(y_true,y_score); st.altair_chart(alt.Chart(pd.DataFrame({"fpr":fpr,"tpr":tpr})).mark_line().encode(x=alt.X("fpr:Q",title="FPR"),y=alt.Y("tpr:Q",title="TPR")).properties(height=200,title=f"ROC (AUC={A:.3f})"),use_container_width=True)
+P,R,_=precision_recall_curve(y_true,y_score); AP=auc(R,P); st.altair_chart(alt.Chart(pd.DataFrame({"recall":R,"precision":P})).mark_line().encode(x="recall:Q",y="precision:Q").properties(height=200,title=f"Precision–Recall (AP≈{AP:.3f})"),use_container_width=True)
 
-# Metrics
-st.subheader("Model Evaluation (test set)")
-c1,c2,c3,c4 = st.columns(4)
-c1.metric("Accuracy",  f"{accuracy_score(yte,yhat):.2%}")
-c2.metric("Precision", f"{precision_score(yte,yhat,zero_division=0):.2%}")
-c3.metric("Recall",    f"{recall_score(yte,yhat,zero_division=0):.2%}")
-c4.metric("F1-score",  f"{f1_score(yte,yhat,zero_division=0):.2%}")
+# Operating point helper
+@st.cache_data(show_spinner=False)
+def load_ops(MT,S,E):
+    sql=f"SELECT threshold,AVG(precision) precision,AVG(recall) recall FROM `{MT}` WHERE dt BETWEEN @S AND @E GROUP BY threshold ORDER BY threshold"
+    return bq.query(sql,job_config=bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("S","DATE",str(S)),bigquery.ScalarQueryParameter("E","DATE",str(E))])).result().to_dataframe()
+st.subheader("Operating point helper"); 
+use_bq=True
+try: OP=load_ops(MT,S,E); use_bq=not OP.empty
+except: use_bq=False
+if not use_bq: grid=np.round(np.linspace(0.05,0.95,19),2); OP=pd.DataFrame([{"threshold":t,"precision":(((df["fraud_score"]>=t)&(y_true==1)).sum()/max(1,(df["fraud_score"]>=t).sum())),"recall":(((df["fraud_score"]>=t)&(y_true==1)).sum()/max(1,(y_true==1).sum()))} for t in grid])
+st.altair_chart(alt.Chart(OP.melt(id_vars="threshold",value_vars=["precision","recall"],var_name="metric",value_name="value")).mark_line(point=True).encode(x="threshold:Q",y=alt.Y("value:Q",axis=alt.Axis(format="%")),color="metric:N").properties(height=200,title=("BigQuery metrics" if use_bq else "Local fallback")),use_container_width=True)
+if not use_bq: st.caption(f"No precomputed metrics at `{MT}`; showing local sweep.")
 
-# -------- New Order decision --------
-st.subheader("New Order – Instant Decision")
-c1,c2,c3 = st.columns(3)
-cat = c1.selectbox("Category", df["sku_category"].unique())
-channel = c2.selectbox("Payment channel", ["Card","Wallet","GiftCard"])
-ship = c3.selectbox("Shipping country", df["ship_country"].unique())
-c4,c5,c6 = st.columns(3)
-ip   = c4.selectbox("Network country", df["ip_country"].unique())
-qty  = c5.number_input("Quantity", 1, 10, 1)
-price= c6.number_input("Unit price", 1.0, 1000.0, 100.0)
-c7,c8,c9 = st.columns(3)
-disc = c7.number_input("Discount", 0.0, 500.0, 0.0)
-gift = c8.number_input("Gift balance", 0.0, 500.0, 0.0)
-age  = c9.number_input("Account age (days)", 0, 3650, 100)
 
-rec = {
-    "sku_category":cat, "payment_channel":channel,"ship_country":ship,"ip_country":ip,
-    "quantity":qty,"unit_price":price,"coupon_discount":disc,"gift_balance_used":gift,
-    "account_age_days":age,"store_id":"s_manual"
-}
-# Same feature pipeline
-rec["order_amount"]=rec["quantity"]*rec["unit_price"]
-rec["price_ratio"]=rec["unit_price"]/df.groupby("sku_category")["unit_price"].transform("mean").mean()
-rec["geo_mismatch"]=int(rec["ip_country"]!=rec["ship_country"])
-rec["coupon_pct"]=rec["coupon_discount"]/rec["order_amount"] if rec["order_amount"] else 0
-rec["gift_pct"]=rec["gift_balance_used"]/rec["order_amount"] if rec["order_amount"] else 0
-
-Xnum=pd.DataFrame([{k:rec[k] for k in feat_num}]).fillna(0)
-Xcat=pd.get_dummies(pd.DataFrame([{k:rec[k] for k in ["payment_channel","sku_category","ship_country","ip_country","store_id"]}]).astype(str))
-Xin=pd.concat([Xnum,Xcat],axis=1).reindex(columns=cols_model,fill_value=0)
-
-if st.button("Check Fraud"):
-    pred = int((clf.predict_proba(Xin)[:,1] >= THRESH)[0])
-    st.markdown(f"### Decision: **{'Fraud' if pred else 'Not Fraud'}**")
 
