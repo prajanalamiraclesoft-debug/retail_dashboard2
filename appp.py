@@ -43,7 +43,7 @@ df=load(PT,FT)
 if df.empty: st.warning("No rows."); st.stop()
 df["is_alert"]=(df.fraud_score>=TH).astype(int)
 
-st.title("Retail Fraud Dashboard")
+st.title("Unified Fraud, Pricing & Inventory Risk Detection Dashboard")
 c1,c2,c3,c4=st.columns([1,1,1,2])
 c1.metric("TOTAL ROWS",len(df)); c2.metric("ALERTS",int(df.is_alert.sum()))
 c3.metric("ALERT RATE",f"{(df.is_alert.mean() if len(df) else 0):.2%}")
@@ -116,5 +116,6 @@ if st.button("Score order"):
          f"Payment: {pay.replace('_',' ')}."]
     st.markdown("**Why:**\n- " + "\n- ".join(why))
     st.caption(f"Amount ≈ {e['amount']:,.2f} · Mean ≈ {e['mean']:,.2f} · P90 ≈ {e['p90']:,.2f}")
+
 
 
