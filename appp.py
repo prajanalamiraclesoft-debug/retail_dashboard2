@@ -77,7 +77,7 @@ st.altair_chart(alt.Chart(df).mark_bar().encode(
     y=alt.Y("count():Q",title="Rows"), tooltip=[alt.Tooltip("count()",title="Rows")]
 ).properties(height=220),use_container_width=True)
 
-st.subheader("Alerts (all)")
+st.subheader("Suspicious Orders")
 cols=[c for c in ["order_id","timestamp","customer_id","store_id","sku_id","sku_category","order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"] if c in df.columns]
 st.dataframe(df[df.is_alert==1].sort_values(["fraud_score","timestamp"],ascending=[False,False])[cols],
              use_container_width=True, height=min(720,28*min(len(df),20)+120))
@@ -116,3 +116,4 @@ if st.button("Score order"):
          f"Payment: {pay.replace('_',' ')}."]
     st.markdown("**Why:**\n- " + "\n- ".join(why))
     st.caption(f"Amount ≈ {e['amount']:,.2f} · Mean ≈ {e['mean']:,.2f} · P90 ≈ {e['p90']:,.2f}")
+
