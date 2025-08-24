@@ -4,7 +4,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-st.set_page_config("Unified Fraud, Pricing & Inventory Risk Detection Dashboard", layout="wide")
+st.set_page_config("Unified Fraud,Pricing & Inventory Risk Detection Dashboard", layout="wide")
 alt.renderers.set_embed_options(actions=False)
 
 with st.sidebar:
@@ -43,7 +43,7 @@ df=load(PT,FT)
 if df.empty: st.warning("No rows."); st.stop()
 df["is_alert"]=(df.fraud_score>=TH).astype(int)
 
-st.title("Unified Fraud, Pricing & Inventory Risk Detection Dashboard")
+st.title("Unified Fraud,Pricing & Inventory Risk Detection")
 c1,c2,c3,c4=st.columns([1,1,1,2])
 c1.metric("TOTAL ROWS",len(df)); c2.metric("ALERTS",int(df.is_alert.sum()))
 c3.metric("ALERT RATE",f"{(df.is_alert.mean() if len(df) else 0):.2%}")
@@ -116,6 +116,7 @@ if st.button("Score order"):
          f"Payment: {pay.replace('_',' ')}."]
     st.markdown("**Why:**\n- " + "\n- ".join(why))
     st.caption(f"Amount ≈ {e['amount']:,.2f} · Mean ≈ {e['mean']:,.2f} · P90 ≈ {e['p90']:,.2f}")
+
 
 
 
