@@ -165,7 +165,7 @@ st.dataframe(df[cols_tx].head(120), height=320, use_container_width=True)
 st.caption("**What this means** · Sample of incoming orders (USA-only).")
 
 # ───────────────────────── Fraud Score Distribution ─────────────────────────
-st.markdown("### Fraud Score Distribution (Test Set)")
+st.markdown("### Fraud Score Distribution")
 hist = alt.Chart(pd.DataFrame({"fraud_score": yprob})).mark_bar().encode(
     x=alt.X("fraud_score:Q", bin=alt.Bin(maxbins=40), title="Fraud Score (0–1)"),
     y=alt.Y("count():Q", title="Orders")
@@ -188,7 +188,7 @@ st.caption("**What this means** · These orders exceed the chosen threshold. "
            "Risk flags show *why* they were scored high.")
 
 # ───────────────────────── Strong Features: counts & importance ─────────────────────────
-st.markdown("### Strong Features — Counts in Flagged vs Non-Flagged (Test Set)")
+st.markdown("### Strong Features — Counts in Flagged vs Non-Flagged ")
 flag = (test_df["fraud_score"] >= TH).astype(int)
 A = int(flag.sum()); NA = int((1-flag).sum())
 
@@ -207,7 +207,7 @@ st.dataframe(tbl, use_container_width=True, height=300)
 st.caption("**What this means** · For each risk signal, how many of the flagged vs non-flagged orders have it. "
            "If a feature is much more common among flagged orders, it is a strong driver.")
 
-st.markdown("### Feature Importance (Permutation Importance on Test Set)")
+st.markdown("### Feature Importance (Permutation Importance")
 # Permutation importance over original feature names (works through pipeline)
 imp = permutation_importance(clf, Xte, yte, n_repeats=10, random_state=42)
 imp_tbl = (pd.DataFrame({"feature": features, "importance": imp.importances_mean})
@@ -258,3 +258,4 @@ if st.button("Score Order"):
     fs = score_one(d)
     st.success(f"Decision: {'FLAGGED' if fs>=TH else 'PASS'} · Fraud Score ≈ {fs:.2f} "
                f"(Business Thr {TH:.2f} | Best Acc {best_acc['thr']:.2f} | Best F1 {best_f1_thr:.2f})")
+
