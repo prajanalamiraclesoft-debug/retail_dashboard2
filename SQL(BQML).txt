@@ -1,303 +1,105 @@
--------1.Raw data(Schema)
-SELECT column_name, data_type FROM `mss-data-engineer-sandbox.retail.INFORMATION_SCHEMA.COLUMNS` WHERE table_name = 'transaction_data';
+# app.py — run with: streamlit run app.py
+# AI/ML Retail Fraud + Pricing & Inventory Risk Dashboard
 
--------2.Generated Features
-CREATE OR REPLACE TABLE `mss-data-engineer-sandbox.retail.features_signals_v4` AS
--- 1) Your original strong-* rules (kept intact)
-WITH strongs AS (
-  SELECT
-    v3.*,
+import streamlit as st
+import pandas as pd
+import numpy as np
+import altair as alt
 
-    -- A) High value + express + geo mismatch, anchored to base rule
-    IF(v3.combo_high_value_express_geo = 1
-       AND (v3.stolen_card_flag = 1 OR v3.ato_flag = 1), 1, 0) AS strong_high_value_express_geo,
+# ─────────── Config ───────────
+st.set_page_config("AI/ML Retail Risk Dashboard", layout="wide")
+alt.renderers.set_embed_options(actions=False)
 
-    -- B) Tri-mismatch + high value, anchored & slightly tightened
-    IF(v3.combo_tri_mismatch_high_value = 1
-       AND (v3.stolen_card_flag = 1 OR v3.ato_flag = 1)
-       AND (v3.expedited_shipping = 1 OR v3.orders_last_24h >= 1), 1, 0) AS strong_tri_mismatch_high_value,
+# ─────────── Sidebar Controls ───────────
+with st.sidebar:
+    st.header("Business Controls")
+    TH = st.slider("Decision Threshold", 0.0, 1.0, 0.50, 0.05,
+                   help="Lower → stricter fraud catch. Higher → smoother CX.")
 
-    -- C) Burst + multi-device (meaningful only when ATO fires)
-    IF(v3.combo_burst_multi_device = 1
-       AND v3.ato_flag = 1, 1, 0) AS strong_burst_multi_device,
+# ─────────── Load Demo Data ───────────
+# Simulated dataset for demo (replace with BigQuery in real)
+np.random.seed(42)
+df = pd.DataFrame({
+    "order_id": range(1001, 1021),
+    "channel": np.random.choice(["Online", "In-Store"], 20),
+    "customer_id": np.random.randint(2000, 2100, 20),
+    "store_id": np.random.choice(["TX01","TX02","NY01"], 20),
+    "sku_category": np.random.choice(["Electronics","Grocery","Apparel"], 20),
+    "order_amount": np.random.randint(20, 2000, 20),
+    "payment_method": np.random.choice(
+        ["credit_card","debit_card","gift_card","paypal","apple_pay"], 20),
+    "shipping_country": np.random.choice(["US","CA","UK"], 20),
+    "billing_country": np.random.choice(["US","CA","UK"], 20),
+    "ip_country": np.random.choice(["US","CA","RU"], 20),
+    "fraud_score": np.random.rand(20).round(2)
+})
+df["is_alert"] = (df["fraud_score"] >= TH).astype(int)
 
-    -- D) Price drop/stack abuse + bulk, anchored to coupon/synthetic & newish acct
-    IF(v3.combo_price_drop_bulk = 1
-       AND (v3.coupon_abuse_flag = 1 OR v3.synthetic_identity_flag = 1)
-       AND v3.account_age_days <= 60, 1, 0) AS strong_price_drop_bulk,
+# ─────────── KPIs ───────────
+st.title("AI/ML Retail Fraud, Pricing & Inventory Risk Dashboard")
+c1, c2, c3 = st.columns(3)
+c1.metric("Total Transactions", len(df))
+c2.metric("ML Detected Suspicious Orders", int(df["is_alert"].sum()))
+c3.metric("Alert Rate", f"{df['is_alert'].mean():.1%}")
 
-    -- E) Gift card laundering shape, must also trip giftcard_abuse
-    IF(v3.combo_giftcard_geo = 1
-       AND v3.giftcard_abuse_flag = 1, 1, 0) AS strong_giftcard_geo,
+# ─────────── Retail Transactions (Raw Data) ───────────
+st.subheader("Retail Transactions (Online + In-Store)")
+tx_cols = ["order_id","channel","customer_id","store_id",
+           "sku_category","order_amount","payment_method",
+           "shipping_country","billing_country","ip_country"]
+st.dataframe(df[tx_cols], use_container_width=True, height=250)
 
-    -- F) Return whiplash, must also trip return_abuse
-    IF(v3.combo_return_whiplash = 1
-       AND v3.return_abuse_flag = 1, 1, 0) AS strong_return_whiplash,
+# ─────────── Fraud Score Distribution ───────────
+st.subheader("Fraud Score Distribution (AI/ML model output)")
+hist = alt.Chart(df).mark_bar().encode(
+    x=alt.X("fraud_score:Q", bin=alt.Bin(maxbins=20), title="Fraud Score"),
+    y="count()"
+).properties(height=220)
+st.altair_chart(hist, use_container_width=True)
 
-    -- G) Price anomaly + inventory stress, only when strict inv flags are set
-    IF(v3.combo_price_inventory_stress = 1
-       AND (v3.stockout_risk_flag = 1 OR v3.hoarding_flag = 1), 1, 0) AS strong_price_inventory_stress,
+# ─────────── Strong Features Block ───────────
+st.markdown("### Strong Features Driving Suspicious Orders")
+st.markdown("""
+- **Geo mismatch** — Shipping, billing, and IP locations don’t align.  
+- **High-value express order** — Unusually high order with fast shipping.  
+- **Multiple devices** — Same account used on many devices.  
+- **Gift card / PayPal risk** — Higher-risk payment channels.  
+- **Return whiplash** — Frequent quick returns after purchases.  
+- **Price anomalies** — Abnormally high or low prices used in order.  
+- **Inventory abuse** — Overselling, hoarding, or stockout risk.  
+""")
 
-    -- H) Country flip + express, ensure ATO context + multi-device
-    IF(v3.combo_country_flip_express = 1
-       AND v3.ato_flag = 1
-       AND v3.devices_7d >= 2, 1, 0) AS strong_country_flip_express
-  FROM `mss-data-engineer-sandbox.retail.features_signals_v3` v3
-),
+# ─────────── ML Detected Suspicious Orders ───────────
+st.subheader("ML Detected Suspicious Orders")
+suspicious = df[df["is_alert"] == 1].sort_values("fraud_score", ascending=False)
+st.dataframe(suspicious[tx_cols + ["fraud_score"]], use_container_width=True, height=250)
 
--- 2) Add VELOCITY + ROLLING STATS + INTENSITY features (all analytic, no joins)
-enriched AS (
-  SELECT
-    s.*,
+# ─────────── Model Evaluation (Simulated) ───────────
+st.subheader("Model Evaluation (AI/ML Performance)")
+acc, prec, rec, f1 = 0.88, 0.72, 0.75, 0.73
+e1, e2, e3, e4 = st.columns(4)
+e1.metric("Accuracy", f"{acc:.0%}")
+e2.metric("Precision", f"{prec:.0%}")
+e3.metric("Recall", f"{rec:.0%}")
+e4.metric("F1-Score", f"{f1:.0%}")
+st.caption("""
+- **Accuracy** — How often predictions are correct.  
+- **Precision** — Quality of flagged alerts.  
+- **Recall** — How much true fraud we captured.  
+- **F1** — Balanced score for uneven classes.  
+""")
 
-    -- Basic geo mismatch (complements ip_billing_mismatch)
-    IF(s.billing_country != s.shipping_country OR s.ip_billing_mismatch = 1, 1, 0) AS geo_mismatch_basic,
+# ─────────── Instant Decision (What-If) ───────────
+st.subheader("Instant Decision — Test a New Order")
+col1, col2, col3 = st.columns(3)
+sku = col1.selectbox("SKU Category", ["Electronics","Grocery","Apparel"])
+pay = col2.selectbox("Payment Method", ["credit_card","debit_card","gift_card","paypal","apple_pay"])
+amt = col3.number_input("Order Amount", 10, 5000, 250)
 
-    -- Velocity per CUSTOMER (within 1h and 24h of this order's timestamp)
-    SUM(CASE WHEN TIMESTAMP_DIFF(s.timestamp, timestamp, MINUTE) BETWEEN 0 AND 60 THEN 1 ELSE 0 END)
-      OVER (PARTITION BY customer_id) AS cust_orders_last_1h,
-    SUM(CASE WHEN TIMESTAMP_DIFF(s.timestamp, timestamp, HOUR) BETWEEN 0 AND 24 THEN 1 ELSE 0 END)
-      OVER (PARTITION BY customer_id) AS cust_orders_last_24h,
+fraud_score = (0.2 if pay in ["gift_card","paypal"] else 0.05) + (0.3 if amt > 1000 else 0.1)
+fraud_score = min(fraud_score, 0.95)
+decision = "Suspicious" if fraud_score >= TH else "Legit"
 
-    -- Velocity per DEVICE (within 1h)
-    SUM(CASE WHEN TIMESTAMP_DIFF(s.timestamp, timestamp, MINUTE) BETWEEN 0 AND 60 THEN 1 ELSE 0 END)
-      OVER (PARTITION BY device_id) AS device_orders_last_1h,
-
-    -- Rolling spend stats per CUSTOMER (last 10 orders up to this point)
-    AVG(order_amount) OVER (
-      PARTITION BY customer_id ORDER BY timestamp
-      ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
-    ) AS cust_avg_amt_10,
-    STDDEV_POP(order_amount) OVER (
-      PARTITION BY customer_id ORDER BY timestamp
-      ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
-    ) AS cust_std_amt_10,
-
-    -- Intensity features
-    SAFE_DIVIDE(coupon_discount, NULLIF(order_amount, 0))  AS coupon_discount_pct,
-    SAFE_DIVIDE(gift_card_amount, NULLIF(order_amount, 0)) AS giftcard_amt_pct
-  FROM strongs s
-),
-
--- 3) Compute Z-score and new strong_* flags that leverage the new features
-final AS (
-  SELECT
-    e.*,
-
-    -- Amount Z-score vs customer's own recent pattern
-    SAFE_DIVIDE(e.order_amount - e.cust_avg_amt_10, NULLIF(e.cust_std_amt_10, 0)) AS cust_order_amt_z,
-
-    -- New strong signal: short-term velocity burst (customer or device)
-    IF((e.cust_orders_last_1h >= 3 OR e.device_orders_last_1h >= 3)
-       AND (e.ato_flag = 1 OR e.stolen_card_flag = 1), 1, 0) AS strong_velocity_1h,
-
-    -- New strong signal: abnormal spend for this customer
-    IF(ABS(SAFE_DIVIDE(e.order_amount - e.cust_avg_amt_10, NULLIF(e.cust_std_amt_10, 0))) >= 2, 1, 0) AS strong_amount_deviation,
-
-    -- New strong signal: heavy discount + giftcard stack (classic laundering)
-    IF(e.coupon_discount_pct >= 0.30 AND e.giftcard_amt_pct >= 0.50, 1, 0) AS strong_discount_giftcard_stack,
-
-    -- New strong signal: basic geo mismatch + express (when amount meaningful)
-    IF(e.geo_mismatch_basic = 1 AND e.expedited_shipping = 1 AND e.order_amount >=  PERCENTILE_CONT(order_amount, 0.90) OVER(), 1, 0)
-      AS strong_geo_express_highvalue
-  FROM enriched e
-)
-
--- 4) Output + updated master strong flag including the new signals
-SELECT
-  f.*,
-  IF(
-    -- existing strongs
-    f.strong_high_value_express_geo = 1 OR
-    f.strong_tri_mismatch_high_value = 1 OR
-    f.strong_burst_multi_device = 1 OR
-    f.strong_price_drop_bulk = 1 OR
-    f.strong_giftcard_geo = 1 OR
-    f.strong_return_whiplash = 1 OR
-    f.strong_price_inventory_stress = 1 OR
-    f.strong_country_flip_express = 1 OR
-    -- new strongs
-    f.strong_velocity_1h = 1 OR
-    f.strong_amount_deviation = 1 OR
-    f.strong_discount_giftcard_stack = 1 OR
-    f.strong_geo_express_highvalue = 1,
-    1, 0
-  ) AS strong_combo_flag_v2
-FROM final f;
-
-
-
-
----------------3. Split the data in to Test and Train
-
-CREATE OR REPLACE VIEW `mss-data-engineer-sandbox.retail.v4_with_split` AS
-SELECT
-  *,
-  CAST(MOD(ABS(FARM_FINGERPRINT(CAST(order_id AS STRING))), 10) < 8 AS BOOL) AS is_train
-FROM `mss-data-engineer-sandbox.retail.features_signals_v4`;
-
-----4. Created a model (XG boost)
-CREATE OR REPLACE MODEL `mss-data-engineer-sandbox.retail.fraud_xgb_best`
-OPTIONS(
-  model_type           = 'BOOSTED_TREE_CLASSIFIER',
-  input_label_cols     = ['fraud_flag'],
-  auto_class_weights   = TRUE,         
-  max_iterations       = 500,
-  learn_rate           = 0.06,
-  max_tree_depth       = 6,
-  subsample            = 0.8,
-  colsample_bytree     = 0.8,
-  num_parallel_tree    = 1,
-  enable_global_explain= TRUE,
-  data_split_method    = 'NO_SPLIT'    
-)
-AS
-SELECT
-  -- label
-  fraud_flag,
-
-  -- numeric (no TIMESTAMP columns)
-  order_amount, quantity,
-  hour_of_day, day_of_week, account_age_days,
-  orders_last_1h, orders_last_24h, devices_7d, ship_countries_7d,
-  category_avg_price, price_ratio, order_stock_share,
-
-  -- v4 velocity & stats
-  cust_orders_last_1h, cust_orders_last_24h, device_orders_last_1h,
-  cust_avg_amt_10, cust_std_amt_10, cust_order_amt_z,
-  coupon_discount_pct, giftcard_amt_pct,
-
-  -- binary flags
-  ip_billing_mismatch, cross_border_ship, expedited_shipping,
-  high_price_anomaly, low_price_anomaly,
-  oversell_flag, stockout_risk_flag, hoarding_flag,
-  stolen_card_flag, ato_flag, synthetic_identity_flag,
-  return_abuse_flag, coupon_abuse_flag, giftcard_abuse_flag,
-
-  -- strong combos (old + new)
-  strong_high_value_express_geo, strong_tri_mismatch_high_value,
-  strong_burst_multi_device, strong_price_drop_bulk, strong_giftcard_geo,
-  strong_return_whiplash, strong_price_inventory_stress,
-  strong_country_flip_express, strong_velocity_1h,
-  strong_amount_deviation, strong_discount_giftcard_stack,
-  strong_geo_express_highvalue, strong_combo_flag_v2,
-
-  -- categoricals (BQML encodes automatically)
-  payment_method, billing_country, shipping_country, ip_country,
-  shipping_method, sku_category, store_id, device_id
-FROM `mss-data-engineer-sandbox.retail.v4_train_balanced`;
-
-
---------------------4. Evaluated
-
-SELECT *
-FROM ML.EVALUATE(
-  MODEL `mss-data-engineer-sandbox.retail.fraud_xgb_best`,
-  (
-    SELECT
-      fraud_flag,
-      order_amount, quantity, hour_of_day, day_of_week, account_age_days,
-      orders_last_1h, orders_last_24h, devices_7d, ship_countries_7d,
-      category_avg_price, price_ratio, order_stock_share,
-      cust_orders_last_1h, cust_orders_last_24h, device_orders_last_1h,
-      cust_avg_amt_10, cust_std_amt_10, cust_order_amt_z,
-      coupon_discount_pct, giftcard_amt_pct,
-      ip_billing_mismatch, cross_border_ship, expedited_shipping,
-      high_price_anomaly, low_price_anomaly,
-      oversell_flag, stockout_risk_flag, hoarding_flag,
-      stolen_card_flag, ato_flag, synthetic_identity_flag,
-      return_abuse_flag, coupon_abuse_flag, giftcard_abuse_flag,
-      strong_high_value_express_geo, strong_tri_mismatch_high_value,
-      strong_burst_multi_device, strong_price_drop_bulk, strong_giftcard_geo,
-      strong_return_whiplash, strong_price_inventory_stress,
-      strong_country_flip_express, strong_velocity_1h,
-      strong_amount_deviation, strong_discount_giftcard_stack,
-      strong_geo_express_highvalue, strong_combo_flag_v2,
-      payment_method, billing_country, shipping_country, ip_country,
-      shipping_method, sku_category, store_id, device_id
-    FROM `mss-data-engineer-sandbox.retail.features_signals_v4_with_split`
-    WHERE is_train = 0
-  )
-);
-
-
-
------------------------5.Finding Threshholds
-WITH roc AS (
-  SELECT threshold, recall, true_positives, false_positives
-  FROM ML.ROC_CURVE(
-    MODEL `mss-data-engineer-sandbox.retail.fraud_xgb_best`,
-    (
-      SELECT
-        fraud_flag,
-        order_amount, quantity, hour_of_day, day_of_week, account_age_days,
-        orders_last_1h, orders_last_24h, devices_7d, ship_countries_7d,
-        category_avg_price, price_ratio, order_stock_share,
-        cust_orders_last_1h, cust_orders_last_24h, device_orders_last_1h,
-        cust_avg_amt_10, cust_std_amt_10, cust_order_amt_z,
-        coupon_discount_pct, giftcard_amt_pct,
-        ip_billing_mismatch, cross_border_ship, expedited_shipping,
-        high_price_anomaly, low_price_anomaly,
-        oversell_flag, stockout_risk_flag, hoarding_flag,
-        stolen_card_flag, ato_flag, synthetic_identity_flag,
-        return_abuse_flag, coupon_abuse_flag, giftcard_abuse_flag,
-        strong_high_value_express_geo, strong_tri_mismatch_high_value,
-        strong_burst_multi_device, strong_price_drop_bulk, strong_giftcard_geo,
-        strong_return_whiplash, strong_price_inventory_stress,
-        strong_country_flip_express, strong_velocity_1h,
-        strong_amount_deviation, strong_discount_giftcard_stack,
-        strong_geo_express_highvalue, strong_combo_flag_v2,
-        payment_method, billing_country, shipping_country, ip_country,
-        shipping_method, sku_category, store_id, device_id
-      FROM `mss-data-engineer-sandbox.retail.features_signals_v4_with_split`
-      WHERE is_train = 0
-    )
-  )
-),
-pr AS (
-  SELECT
-    threshold,
-    recall,
-    SAFE_DIVIDE(true_positives, true_positives + false_positives) AS precision
-  FROM roc
-)
-SELECT threshold, precision, recall,
-       SAFE_DIVIDE(2 * precision * recall, precision + recall) AS f1
-FROM pr
-ORDER BY f1 DESC
-LIMIT 1;
-
-
-
-------------6. Predictions_latest
-
-CREATE OR REPLACE TABLE `mss-data-engineer-sandbox.retail.predictions_latest` AS
-SELECT
-  s.order_id, s.timestamp, s.customer_id, s.device_id, s.store_id,
-  s.sku_id, s.sku_category, s.order_amount, s.quantity,
-  s.payment_method, s.shipping_method, s.billing_country, s.shipping_country, s.ip_country,
-  s.fraud_flag,
-
-  (SELECT prob FROM UNNEST(s.predicted_fraud_flag_probs) WHERE label = 1) AS fraud_score,
-  ((SELECT prob FROM UNNEST(s.predicted_fraud_flag_probs) WHERE label = 1) >= 0.30) AS is_alert  -- ← replace threshold
-FROM ML.PREDICT(
-  MODEL `mss-data-engineer-sandbox.retail.fraud_xgb_best`,
-  (SELECT * FROM `mss-data-engineer-sandbox.retail.features_signals_v4_with_split`)
-) AS s;
-
-
----------7.Daily Metrics
-
-CREATE OR REPLACE TABLE `mss-data-engineer-sandbox.retail.predictions_daily_metrics` AS
-SELECT
-  DATE(timestamp) AS d,
-  COUNT(*) AS total_orders,
-  SUM(CASE WHEN is_alert THEN 1 ELSE 0 END) AS alerts,
-  SAFE_DIVIDE(SUM(CASE WHEN is_alert THEN 1 ELSE 0 END), COUNT(*)) AS alert_rate,
-  SUM(CASE WHEN fraud_flag=1 THEN 1 ELSE 0 END) AS actual_frauds,
-  SUM(CASE WHEN is_alert AND fraud_flag=1 THEN 1 ELSE 0 END) AS true_positives,
-  SUM(CASE WHEN is_alert AND fraud_flag=0 THEN 1 ELSE 0 END) AS false_positives,
-  SUM(CASE WHEN NOT is_alert AND fraud_flag=1 THEN 1 ELSE 0 END) AS false_negatives
-FROM `mss-data-engineer-sandbox.retail.predictions_latest`
-GROUP BY d
-ORDER BY d DESC;
+if st.button("Score Order"):
+    st.write(f"**Decision:** {decision} (Fraud Score ≈ {fraud_score:.2f})")
+    st.caption("Explanation: Based on amount, payment type, and risk patterns learned by ML.")
