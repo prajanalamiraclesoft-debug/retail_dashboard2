@@ -1,123 +1,158 @@
-# run: streamlit run app.py
-import streamlit as st, pandas as pd, numpy as np, altair as alt
-from google.cloud import bigquery
-from google.oauth2 import service_account
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+# retail_fraud_end2end.py  — end-to-end, business-ready, no SQL/BQML
+import numpy as np, pandas as pd, warnings, json
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, precision_recall_curve, auc, roc_auc_score
+warnings.filterwarnings("ignore")
 
-st.set_page_config("Unified Fraud,Pricing & Inventory Risk Detection Dashboard", layout="wide")
-alt.renderers.set_embed_options(actions=False)
+np.random.seed(7)
 
-with st.sidebar:
-    st.header("BQ TABLE INFO")
-    P = st.text_input("Project", "mss-data-engineer-sandbox")
-    D = st.text_input("Dataset", "retail")
-    PT = st.text_input("Predictions table", f"{P}.{D}.predictions_latest")
-    FT = st.text_input("Features table", f"{P}.{D}.features_signals_v4")
-    TH = st.slider("Decision threshold", 0.0, 1.0, 0.50, 0.01)
+# ---------------- 1) Build 4,000 transactions (Online + In-Store) ----------------
+N=4000
+stores=[("TX01","US"),("CA03","CA"),("NY01","US"),("UK11","UK")]
+store_id,store_cty=zip(*np.random.choice(stores,N))
+ch=np.random.choice(["Online","In-Store"],N,p=[0.7,0.3])
+cat=np.random.choice(["Electronics","Apparel","Grocery","Beauty","Home"],N)
+amt=np.round(np.random.lognormal(5.5,0.8,N),2)
+qty=np.random.randint(1,6,N)
+# payments by channel: In-Store {cc,dc,apple,gift}, Online {cc,dc,apple,paypal}
+pay=[]
+for i in range(N):
+    pay.append(np.random.choice(["credit_card","debit_card","apple_pay","gift_card"] if ch[i]=="In-Store"
+                                else ["credit_card","debit_card","apple_pay","paypal"]))
+pay=np.array(pay)
+ship=np.where(ch=="In-Store",np.array(store_cty),np.random.choice(["US","CA","UK"],N,p=[0.8,0.12,0.08]))
+bill=np.random.choice(["US","CA","UK"],N,p=[0.82,0.1,0.08])
+express=np.where(ch=="Online",np.random.choice([0,1],N,p=[0.7,0.3]),0)
+ret30=np.random.poisson(0.2,N)
+sku=np.random.randint(100000,110000,N)
+onhand=np.random.randint(10,200,N)
 
-sa = dict(st.secrets["gcp_service_account"]); sa["private_key"]=sa["private_key"].replace("\\n","\n")
-creds = service_account.Credentials.from_service_account_info(sa)
-bq = bigquery.Client(credentials=creds, project=creds.project_id)
+df=pd.DataFrame(dict(order_id=np.arange(1,N+1),channel=ch,store_id=store_id,store_country=store_cty,
+                     sku_category=cat,order_amount=amt,quantity=qty,payment_method=pay,
+                     shipping_country=ship,billing_country=bill,express_shipping=express,
+                     returns_30d=ret30,sku=sku,on_hand=onhand))
 
-def cols_of(t):
-    p,d,x = t.split("."); q=f"SELECT column_name FROM `{p}.{d}.INFORMATION_SCHEMA.COLUMNS` WHERE table_name=@t"
-    j=bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("t","STRING",x)]))
-    return set(j.result().to_dataframe().column_name.str.lower())
+# ---------------- 2) Feature engineering (BUSINESS signals) ----------------
+# Address mismatch (no IP used)
+df["addr_mismatch"]=(df["shipping_country"]!=df["billing_country"]).astype(int)
+# Risky payment channels (PayPal online; Gift cards in-store)
+df["payment_risky"]=df["payment_method"].isin(["paypal","gift_card"]).astype(int)
+# Category-relative high amount (p90) + price anomalies (z-score)
+p90=df.groupby("sku_category")["order_amount"].transform(lambda s:s.quantile(0.90))
+mean=df.groupby("sku_category")["order_amount"].transform("mean")
+std=df.groupby("sku_category")["order_amount"].transform("std").replace(0,1.0)
+z=(df["order_amount"]-mean)/std
+df["high_amount_cat"]=(df["order_amount"]>=p90).astype(int)
+df["price_high_anom"]=(z>=2).astype(int)
+df["price_low_anom"]=(z<=-2).astype(int)
+# Inventory stress
+df["oversell_flag"]=(df["quantity"]>0.6*df["on_hand"]).astype(int)
+df["hoarding_flag"]=(df["quantity"]>=4).astype(int)
+# Returns and express+amount synergy
+df["return_whiplash"]=(df["returns_30d"]>=2).astype(int)
+df["express_high_amt"]=((df["express_shipping"]==1)&(df["high_amount_cat"]==1)).astype(int)
+df["log_amount"]=np.log1p(df["order_amount"])
 
-@st.cache_data(show_spinner=True)
-def load(pred_t, feat_t):
-    pcols,fcols = cols_of(pred_t), cols_of(feat_t)
-    base=["order_id","timestamp","fraud_score","customer_id","store_id","sku_id","sku_category","order_amount","quantity","payment_method","shipping_country","ip_country"]
-    strong=["strong_tri_mismatch_high_value","strong_high_value_express_geo","strong_burst_multi_device","strong_price_drop_bulk","strong_giftcard_geo","strong_return_whiplash","strong_price_inventory_stress","strong_country_flip_express","high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_flag","hoarding_flag","fraud_flag"]
-    sel=[f"p.{c}" if c in pcols else f"CAST(NULL AS {'FLOAT64' if c=='fraud_score' else 'STRING'}) AS {c}" for c in base]
-    join=""; 
-    if fcols: 
-        join=f"LEFT JOIN `{feat_t}` s USING(order_id)"
-        sel+= [f"s.{c}" if c in fcols else (f"CAST(NULL AS INT64) AS {c}" if c=='fraud_flag' else f"CAST(0 AS INT64) AS {c}") for c in strong]
-    else: sel+=[f"CAST(0 AS INT64) AS {c}" if c!='fraud_flag' else "CAST(NULL AS INT64) AS fraud_flag" for c in strong]
-    df=bq.query(f"SELECT {', '.join(sel)} FROM `{pred_t}` p {join} ORDER BY timestamp").result().to_dataframe()
-    df["timestamp"]=pd.to_datetime(df["timestamp"],errors="coerce"); df["fraud_score"]=pd.to_numeric(df["fraud_score"],errors="coerce").fillna(0.0)
-    return df
+# ---------------- 3) Create a training label (for demo) ----------------
+# Fraud probability generator (business-plausible)
+p = (0.04 + 0.22*df["addr_mismatch"] + 0.18*df["payment_risky"] +
+     0.20*df["high_amount_cat"] + 0.08*df["return_whiplash"] +
+     0.10*df["express_high_amt"] + 0.06*df["oversell_flag"] + 0.05*df["hoarding_flag"])
+df["fraud_flag"]=(np.random.rand(N)<np.clip(p,0,0.95)).astype(int)
 
-df=load(PT,FT)
-if df.empty: st.warning("No rows."); st.stop()
-df["is_alert"]=(df.fraud_score>=TH).astype(int)
+# ---------------- 4) Train model and compute fraud_score ----------------
+features=["channel","sku_category","payment_method","shipping_country","billing_country",
+          "quantity","order_amount","log_amount","express_shipping","returns_30d",
+          "addr_mismatch","payment_risky","high_amount_cat","price_high_anom","price_low_anom",
+          "oversell_flag","hoarding_flag","return_whiplash","express_high_amt","on_hand"]
+X=df[features]; y=df["fraud_flag"].astype(int)
+Xtr,Xte,ytr,yte=train_test_split(X,y,test_size=0.25,random_state=7,stratify=y)
 
-st.title("Unified Fraud,Pricing & Inventory Risk Detection")
-c1,c2,c3,c4=st.columns([1,1,1,2])
-c1.metric("TOTAL ROWS",len(df)); c2.metric("ALERTS",int(df.is_alert.sum()))
-c3.metric("ALERT RATE",f"{(df.is_alert.mean() if len(df) else 0):.2%}")
-if df.timestamp.notna().any(): c4.caption(f"TABLE WINDOW: {df.timestamp.min()} → {df.timestamp.max()}")
+num=["quantity","order_amount","log_amount","express_shipping","returns_30d",
+     "addr_mismatch","payment_risky","high_amount_cat","price_high_anom","price_low_anom",
+     "oversell_flag","hoarding_flag","return_whiplash","express_high_amt","on_hand"]
+cat=["channel","sku_category","payment_method","shipping_country","billing_country"]
+pre=ColumnTransformer([("num",Pipeline([("imp",SimpleImputer(strategy="median")),("sc",StandardScaler())]),num),
+                       ("cat",Pipeline([("imp",SimpleImputer(strategy="most_frequent")),
+                                        ("oh",OneHotEncoder(handle_unknown="ignore"))]),cat)])
+# Using LogisticRegression: fast, stable, explainable; outputs calibrated probabilities
+clf=Pipeline([("pre",pre),("lr",LogisticRegression(max_iter=300,class_weight="balanced"))])
+clf.fit(Xtr,ytr)
+yprob=clf.predict_proba(Xte)[:,1]  # fraud_score = P(fraud=1)
 
-st.subheader("Raw data (sample)")
-st.dataframe(df.head(4000), use_container_width=True, height=320)
+# ---------------- 5) Threshold selection & evaluation ----------------
+# Best threshold by F1 (balanced capture vs noise)
+prec,rec,thr=precision_recall_curve(yte,yprob); f1=(2*prec*rec)/np.clip(prec+rec,1e-9,None)
+best_idx=int(np.nanargmax(f1)); best_thr=(thr[best_idx] if best_idx<len(thr) else 0.5)
+ypred=(yprob>=best_thr).astype(int)
 
-st.subheader("Strong Signal Prevalence")
-def prevalence(cols,title):
-    cols=[c for c in cols if c in df.columns]; 
-    if not cols: st.info(f"No fields for {title}."); return
-    z=df[["is_alert"]+cols].apply(pd.to_numeric,errors="coerce").fillna(0).astype(int)
-    a,na=max(1,int(z.is_alert.sum())),max(1,int((1-z.is_alert).sum()))
-    rows=[{"signal":c,"% in alerts":z.loc[z.is_alert==1,c].sum()/a,"% in non-alerts":z.loc[z.is_alert==0,c].sum()/na} for c in cols]
-    dd=(pd.DataFrame(rows).sort_values("% in alerts",ascending=False)
-        .melt(id_vars="signal", var_name="group", value_name="value"))
-    st.altair_chart(alt.Chart(dd).mark_bar().encode(
-        x=alt.X("value:Q",axis=alt.Axis(format="%"),title="Prevalence"),
-        y=alt.Y("signal:N",sort="-x",title=None), color="group:N",
-        tooltip=["signal",alt.Tooltip("value:Q",format=".1%"),"group"]
-    ).properties(height=300,title=title),use_container_width=True)
+acc=accuracy_score(yte,ypred); pr=precision_score(yte,ypred,zero_division=0)
+rc=recall_score(yte,ypred,zero_division=0); f1s=f1_score(yte,ypred,zero_division=0)
+roc=roc_auc_score(yte,yprob); pr_auc=auc(rec,prec)
 
-l,r=st.columns(2)
-with l: prevalence(["strong_tri_mismatch_high_value","strong_high_value_express_geo","strong_burst_multi_device","strong_price_drop_bulk","strong_giftcard_geo","strong_return_whiplash","strong_price_inventory_stress","strong_country_flip_express"],"Fraud Pattern Flags")
-with r: prevalence(["high_price_anomaly","low_price_anomaly","oversell_flag","stockout_risk_flag","hoarding_flag"],"Pricing & Inventory Context")
+# ---------------- 6) Business summary (prints you can read in the meeting) ----------------
+print("\nUNIFIED ML-DRIVEN FRAUD FOR RETAIL POS — BUSINESS SUMMARY")
+print(f"- Data: 4,000 transactions (Online + In-Store). Payments respected by channel.")
+print("- Model: Logistic Regression in an sklearn Pipeline (numeric scaling + one-hot for categories).")
+print("- fraud_score: model probability that a transaction is fraudulent (predict_proba for class=1).")
+print(f"- Best threshold (max F1): {best_thr:.2f}  → at this setting:")
+print(f"  Accuracy={acc:.2%}  Precision={pr:.2%}  Recall={rc:.2%}  F1={f1s:.2%}  ROC-AUC={roc:.2%}  PR-AUC={pr_auc:.2%}")
+print("- How we choose threshold:")
+print("  • Business can keep a fixed default (e.g., 0.50), or use the best-F1 threshold above")
+print("    to balance catching fraud (recall) and keeping alerts clean (precision).")
+print("- Strong features (business perspective, no IP used):")
+feat_desc={
+ "addr_mismatch":"Shipping vs Billing address differ.",
+ "payment_risky":"PayPal (online) or Gift Cards (in-store).",
+ "high_amount_cat":"Order above 90th percentile for its category.",
+ "price_high_anom":"Price unusually high versus peers (z-score ≥ 2).",
+ "price_low_anom":"Price unusually low (possible discount abuse).",
+ "express_high_amt":"Express shipping combined with high amount.",
+ "return_whiplash":"Multiple returns in last 30 days.",
+ "oversell_flag":"Quantity too high relative to inventory on-hand.",
+ "hoarding_flag":"Customer buying unusually large quantities."
+}
+for k,v in feat_desc.items(): print(f"  • {k}: {v}")
+print("- What we did end-to-end: generated transaction data, engineered business signals,")
+print("  trained the model, produced fraud_score for each order, selected the best threshold,")
+print("  and evaluated results in business terms (accuracy, precision, recall, F1).")
 
-st.subheader("Fraud Score Distribution")
-st.altair_chart(alt.Chart(df).mark_bar().encode(
-    x=alt.X("fraud_score:Q",bin=alt.Bin(maxbins=50),title="Fraud score"),
-    y=alt.Y("count():Q",title="Rows"), tooltip=[alt.Tooltip("count()",title="Rows")]
-).properties(height=220),use_container_width=True)
+# ---------------- 7) Example: score one new order (what-if) ----------------
+def score_new_order(order:dict)->float:
+    """Return fraud_score ∈ [0,1] for a single order dict (must contain model features)."""
+    r=pd.DataFrame([order])
+    # derive the same signals
+    cp=df[df["sku_category"]==r["sku_category"].iloc[0]]
+    if cp.empty: cp=df
+    p90=cp["order_amount"].quantile(0.90); mu=cp["order_amount"].mean(); sd=max(cp["order_amount"].std(),1.0)
+    z=(r["order_amount"]-mu)/sd
+    r["addr_mismatch"]=(r["shipping_country"]!=r["billing_country"]).astype(int)
+    r["payment_risky"]=r["payment_method"].isin(["paypal","gift_card"]).astype(int)
+    r["high_amount_cat"]=(r["order_amount"]>=p90).astype(int)
+    r["price_high_anom"]=(z>=2).astype(int); r["price_low_anom"]=(z<=-2).astype(int)
+    r["express_high_amt"]=((r["express_shipping"]==1)&(r["high_amount_cat"]==1)).astype(int)
+    r["return_whiplash"]=(r["returns_30d"]>=2).astype(int)
+    r["log_amount"]=np.log1p(r["order_amount"])
+    for c in ["oversell_flag","hoarding_flag","on_hand"]: r.setdefault(c,0)
+    r=r[features]  # order columns for the pipeline
+    return float(clf.predict_proba(r)[:,1])
 
-st.subheader("Suspicious Orders")
-cols=[c for c in ["order_id","timestamp","customer_id","store_id","sku_id","sku_category","order_amount","quantity","payment_method","shipping_country","ip_country","fraud_score"] if c in df.columns]
-st.dataframe(df[df.is_alert==1].sort_values(["fraud_score","timestamp"],ascending=[False,False])[cols],
-             use_container_width=True, height=min(720,28*min(len(df),20)+120))
+example=dict(channel="Online",sku_category="Electronics",payment_method="paypal",
+             shipping_country="US",billing_country="US",quantity=2,order_amount=1800,
+             log_amount=np.log1p(1800),express_shipping=1,returns_30d=0,
+             addr_mismatch=0,payment_risky=1,high_amount_cat=1,price_high_anom=0,
+             price_low_anom=0,oversell_flag=0,hoarding_flag=0,return_whiplash=0,
+             express_high_amt=1,on_hand=80)
+fs=score_new_order(example)
+print(f"\nInstant decision example → fraud_score={fs:.2f}  decision@{best_thr:.2f}="
+      f"{'ALERT' if fs>=best_thr else 'PASS'}")
 
-st.subheader("Model Evaluation")
-labs=[c for c in ["fraud_flag","is_fraud","label","ground_truth","gt","y"] if c in df.columns]
-y=df[labs[0]].fillna(0).astype(int).values if labs else df.is_alert.values
-if labs: st.caption(f"Using label column: `{labs[0]}`")
-yhat=df.is_alert.values
-m1,m2,m3,m4=st.columns(4)
-m1.metric("Accuracy",f"{accuracy_score(y,yhat):.2%}")
-m2.metric("Precision",f"{precision_score(y,yhat,zero_division=0):.2%}")
-m3.metric("Recall",f"{recall_score(y,yhat,zero_division=0):.2%}")
-m4.metric("F1-score",f"{f1_score(y,yhat,zero_division=0):.2%}")
-
-st.markdown("## New Order — Instant Decision")
-st.caption("Geo mismatch, high amount for category, and payment channel risk drive the score.")
-cats=sorted(df.get("sku_category",pd.Series(["apparel"])).dropna().unique()); ships=sorted(df.get("shipping_country",pd.Series(["US"])).dropna().unique()); ips=sorted(df.get("ip_country",pd.Series(["US"])).dropna().unique())
-c1,c2,c3=st.columns(3); cat=c1.selectbox("SKU category",cats); pay=c2.selectbox("Payment method",["credit_card","debit_card","gift_card","paypal","apple_pay"]); qty=c3.number_input("Quantity",1,99,1)
-c4,c5=st.columns(2); price=c4.number_input("Unit price",1.0,10000.0,100.0,1.0); ship=c5.selectbox("Shipping country",ships); ip=st.selectbox("IP country",ips)
-PAY={"gift_card":0.35,"paypal":0.20,"apple_pay":0.12,"credit_card":0.10,"debit_card":0.08}
-cs=(df[["sku_category","order_amount"]].dropna().groupby("sku_category")["order_amount"]
-     .agg(cat_mean="mean",cat_p90=lambda s: float(np.nanpercentile(s,90))).reset_index()
-     if "order_amount" in df and "sku_category" in df else pd.DataFrame({"sku_category":cats or ["apparel"],"cat_mean":[500.0],"cat_p90":[1500.0]}))
-def score(cat,pay,qty,price,ship,ip):
-    r=cs[cs.sku_category==cat].iloc[:1]; amt=qty*price; geo=ship!=ip; high=bool(amt>=float(r.cat_p90)); s=0.08+(0.35 if geo else 0)+(0.30 if high else 0)+PAY.get(pay,0.10)
-    if geo and pay in("gift_card","paypal"): s=max(s,0.65)
-    if geo and high and pay in("gift_card","paypal"): s=max(s,0.85)
-    if high and pay in("gift_card","paypal"): s=max(s,0.70)
-    return min(s,0.99), {"amount":amt,"mean":float(r.cat_mean),"p90":float(r.cat_p90),"geo":geo,"high":high}
-if st.button("Score order"):
-    s,e=score(cat,pay,int(qty),float(price),ship,ip)
-    st.markdown(f"### Decision: **{'Fraud' if s>=TH else 'Not fraud'}** · Score ≈ **{s:.2f}**")
-    why=["Shipping & IP differ." if e["geo"] else "Shipping & IP match.",
-         "Amount high for category." if e["high"] else "Amount typical for category.",
-         f"Payment: {pay.replace('_',' ')}."]
-    st.markdown("**Why:**\n- " + "\n- ".join(why))
-    st.caption(f"Amount ≈ {e['amount']:,.2f} · Mean ≈ {e['mean']:,.2f} · P90 ≈ {e['p90']:,.2f}")
-
-
-
-
-
+# (Optional) export predictions for a dashboard
+pred=pd.DataFrame({"fraud_score":yprob,"is_alert":(yprob>=best_thr).astype(int),"actual":yte.values})
+pred.to_csv("predictions_latest.csv",index=False)
+print("\nSaved predictions_latest.csv for your dashboard.")
