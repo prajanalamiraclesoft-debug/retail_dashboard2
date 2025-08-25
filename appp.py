@@ -90,7 +90,7 @@ def evaluate_at(thr: float):
     )
 
 # ───────────────────────── 5) Dashboard UI ─────────────────────────
-st.title("Unified ML-Driven Fraud Detection for Retail POS")
+st.title("Unifid ML-Driven Fraud Detection for Retail POS")
 st.subheader("Bridging Behavioral Risk, Pricing Anomalies, and Inventory Stress")
 st.caption(f"Build: {time.strftime('%Y-%m-%d %H:%M:%S')} · File: appp.py")
 
@@ -211,3 +211,4 @@ example=dict(channel=chan_sel, sku_category=cat_sel, payment_method=pay_sel,
 if st.button("Score Order"):
     fs=score_new_order(example)
     st.success(f"Decision: {'ALERT' if fs>=TH else 'PASS'} · Fraud Score ≈ {fs:.2f} (Threshold {TH:.2f})")
+
